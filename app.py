@@ -116,6 +116,7 @@ def create_app(config=None, http=None):
         try:
             asyncio.run(execute()); repository.set_run_state(run["id"],"succeeded")
         except Exception as exc:
+            app.logger.exception("Test-only eBay browser flow failed")
             safe=exc.safe_dict() if hasattr(exc,"safe_dict") else {"code":"browser_flow_failed","message":"Browser automation failed safely"}
             repository.set_run_state(run["id"],"failed",safe)
         return redirect(url_for("automation_run_detail",run_id=run["id"]))
