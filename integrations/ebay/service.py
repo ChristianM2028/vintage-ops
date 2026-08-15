@@ -51,4 +51,5 @@ class EbayService:
     # Explicit adapter interface; camelCase remains for compatibility with the
     # original Sandbox lifecycle and callers.
     def list(self,item): return self.listItem(item)
+    def update(self,item): return self.updateItem(item)
     def delist(self,item): return self.delistItem(item)
