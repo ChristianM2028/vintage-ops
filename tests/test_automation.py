@@ -67,3 +67,12 @@ def test_browser_storage_state_is_encrypted_and_revocable(db):
     with db.connect() as c: raw=c.execute("SELECT encrypted_storage_state FROM marketplace_accounts").fetchone()[0]
     assert b"private" not in raw and asyncio.run(storage.load_encrypted("ebay"))==state
     asyncio.run(storage.revoke("ebay")); assert asyncio.run(storage.load_encrypted("ebay")) is None
+
+def test_run_detail_returns_attempts_in_creation_order_and_safe_values(db):
+    repo=AutomationRepository(db); run=repo.create_run(item(db)["id"],"ebay","list")
+    repo.record_field(run["id"],"title","started",evidence={"description":"private"})
+    repo.record_field(run["id"],"title","failed",handler="TextHandler",resolution=.91,classification=.98,error={"password":"secret"})
+    detail=repo.get_run_detail(run["id"])
+    assert [row["state"] for row in detail["field_attempts"]]==["started","failed"]
+    assert "private" not in detail["field_attempts"][0]["evidence_json"]
+    assert "secret" not in detail["field_attempts"][1]["safe_error_json"]

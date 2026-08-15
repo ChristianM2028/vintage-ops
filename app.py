@@ -1,4 +1,5 @@
-import json, logging, os, re, secrets
+import asyncio, json, logging, os, re, secrets
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -9,6 +10,17 @@ from db import Database, STATUSES
 from integrations.ebay import EbayService, MockEbayAdapter, EbayError
 from integrations.ebay.client import EbayClient
 from integrations.ebay.oauth import OAuthManager
+from automation.adapters.ebay import EbayBrowserAdapter
+from automation.classifier import ClassifierConfig, InteractionClassifier
+from automation.engine import FieldEngine
+from automation.repository import AutomationRepository
+from automation.resolver import ResolverConfig, SemanticResolver
+from automation.workflow import ListingWorkflow
+
+def async_playwright():
+    # Playwright is optional unless the explicitly enabled test route is used.
+    from playwright.async_api import async_playwright as factory
+    return factory()
 
 IMAGE_SIGNATURES={"jpg":lambda b:b.startswith(b"\xff\xd8\xff"),"jpeg":lambda b:b.startswith(b"\xff\xd8\xff"),"png":lambda b:b.startswith(b"\x89PNG\r\n\x1a\n"),"gif":lambda b:b.startswith((b"GIF87a",b"GIF89a")),"webp":lambda b:len(b)>=12 and b[:4]==b"RIFF" and b[8:12]==b"WEBP"}
 
@@ -77,7 +89,36 @@ def create_app(config=None, http=None):
     def inventory():
         status=request.args.get("status"); return render_template("inventory.html",items=db.inventory(status),statuses=STATUSES,selected=status)
     @app.get("/items/<int:item_id>")
-    def item_page(item_id): return render_template("item.html",item=item_or_404(item_id),mock_mode=cfg.marketplace_mock_mode)
+    def item_page(item_id): return render_template("item.html",item=item_or_404(item_id),mock_mode=cfg.marketplace_mock_mode,test_browser_flow=cfg.test_ebay_browser_flow)
+    @app.get("/automation-runs/<run_id>")
+    def automation_run_detail(run_id):
+        run=AutomationRepository(db).get_run_detail(run_id)
+        if not run: abort(404)
+        return render_template("automation_run.html",run=run)
+    @app.post("/items/<int:item_id>/test-ebay-browser-flow")
+    def test_ebay_browser_flow(item_id):
+        if not cfg.test_ebay_browser_flow: abort(404)
+        item=item_or_404(item_id); repository=AutomationRepository(db); run=repository.create_run(item["id"],"ebay","list")
+        async def execute():
+            adapter=EbayBrowserAdapter()
+            resolver=SemanticResolver(ResolverConfig(write_threshold=cfg.automation_resolution_threshold,score_margin=cfg.automation_resolution_margin))
+            classifier=InteractionClassifier(ClassifierConfig(action_threshold=cfg.automation_classification_threshold))
+            profile=Path(cfg.ebay_browser_user_data_directory).expanduser().resolve(); profile.mkdir(parents=True,exist_ok=True)
+            async with async_playwright() as playwright:
+                context=await playwright.chromium.launch_persistent_context(user_data_dir=str(profile),headless=False)
+                page=await context.new_page()
+                @asynccontextmanager
+                async def existing_page(_adapter,_run): yield page
+                try:
+                    repository.set_run_state(run["id"],"running")
+                    await ListingWorkflow(adapter,FieldEngine(resolver,classifier),repository,existing_page).execute(run)
+                finally: await context.close()
+        try:
+            asyncio.run(execute()); repository.set_run_state(run["id"],"succeeded")
+        except Exception as exc:
+            safe=exc.safe_dict() if hasattr(exc,"safe_dict") else {"code":"browser_flow_failed","message":"Browser automation failed safely"}
+            repository.set_run_state(run["id"],"failed",safe)
+        return redirect(url_for("automation_run_detail",run_id=run["id"]))
     def run_action(item_id, operation, success):
         item=item_or_404(item_id)
         try: item=getattr(adapters()["ebay"],operation)(item); flash(success,"success")

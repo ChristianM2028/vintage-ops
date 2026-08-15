@@ -14,6 +14,13 @@ class AutomationRepository:
         with self.db.connect() as c:
             row=c.execute("SELECT * FROM automation_runs WHERE id=?",(run_id,)).fetchone()
             return dict(row) if row else None
+    def get_run_attempts(self,run_id):
+        with self.db.connect() as c:
+            return [dict(row) for row in c.execute("SELECT * FROM automation_field_attempts WHERE run_id=? ORDER BY id",(run_id,)).fetchall()]
+    def get_run_detail(self,run_id):
+        run=self.get_run(run_id)
+        if run is not None: run["field_attempts"]=self.get_run_attempts(run_id)
+        return run
     def set_run_state(self,run_id,state,error=None,checkpoint=None):
         safe=json.dumps(redact(error)) if error else None
         with self.db.transaction() as c: c.execute("UPDATE automation_runs SET state=?,safe_error_json=?,checkpoint_field=COALESCE(?,checkpoint_field),updated_at=? WHERE id=?",(state,safe,checkpoint,now(),run_id))
