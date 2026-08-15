@@ -3,6 +3,7 @@ from urllib.parse import quote
 from .errors import EbayError
 
 class EbayService:
+    name = "ebay"
     def __init__(self, config, db, client): self.cfg=config; self.db=db; self.client=client
     def _prereqs(self,item):
         missing=[name for name,value in {"merchant location key":self.cfg.location_key,"fulfillment policy ID":self.cfg.fulfillment_policy_id,"payment policy ID":self.cfg.payment_policy_id,"return policy ID":self.cfg.return_policy_id,"leaf category ID":item.get("category") or self.cfg.category_id}.items() if not value]
@@ -25,7 +26,7 @@ class EbayService:
                 result=self.client.request("POST","/sell/inventory/v1/offer",json=self._offer(item),expected=(201,))
                 item=self.db.update_item(item["id"],ebay_offer_id=result["offerId"],ebay_publication_state="offer_created")
             result=self.client.request("POST",f"/sell/inventory/v1/offer/{quote(item['ebay_offer_id'],safe='')}/publish",expected=(200,))
-            return self.db.update_item(item["id"],ebay_listing_id=result["listingId"],ebay_publication_state="published",last_error=None)
+            return self.db.update_item(item["id"],ebay_listing_id=result["listingId"],ebay_publication_state="published",status="Active",last_error=None)
         except EbayError as e:
             state="partial_failure" if self.db.get_item(item["id"]).get("ebay_offer_id") else "failed"
             self.db.update_item(item["id"],ebay_publication_state=state,last_error=json.dumps(e.safe_dict()))
@@ -46,4 +47,8 @@ class EbayService:
         try: self.client.request("POST",f"/sell/inventory/v1/offer/{quote(item['ebay_offer_id'],safe='')}/withdraw",expected=(200,204))
         except EbayError as e:
             self.db.update_item(item["id"],last_error=json.dumps(e.safe_dict())); e.kind="withdrawal_failure"; raise
-        return self.db.update_item(item["id"],ebay_publication_state="withdrawn",last_error=None)
+        return self.db.update_item(item["id"],ebay_publication_state="withdrawn",status="Delisted",last_error=None)
+    # Explicit adapter interface; camelCase remains for compatibility with the
+    # original Sandbox lifecycle and callers.
+    def list(self,item): return self.listItem(item)
+    def delist(self,item): return self.delistItem(item)
