@@ -1,6 +1,6 @@
 # Vintage Ops
 
-A deliberately small local Flask/SQLite application for preparing clothing inventory and publishing it to **eBay Sandbox**. It uses one Python runtime, server-rendered pages, encrypted seller tokens, and no browser-side credentials. All eBay code is isolated in `integrations/ebay/`; there is intentionally no premature marketplace abstraction.
+A deliberately small local Flask/SQLite seller application for preparing clothing inventory and publishing it to eBay. It uses one Python runtime, server-rendered pages, encrypted seller tokens, and no browser-side credentials. A narrow adapter boundary keeps the real eBay integration isolated.
 
 ## Stack and setup
 
@@ -13,6 +13,10 @@ set -a; . ./.env; set +a
 make migrate
 make run
 ```
+
+The example defaults to `MARKETPLACE_MOCK_MODE=true`. Visit `/` to create an item with local photos, then use `/inventory` to list or delist it against the network-free mock. Uploaded media lives in `instance/uploads`; its directory, per-file size limit, extensions, and photo-count limit are configurable with `UPLOAD_DIRECTORY`, `MAX_UPLOAD_SIZE`, `PERMITTED_IMAGE_EXTENSIONS`, and `MAX_PHOTO_COUNT`. `.env`, uploaded media, SQLite databases, and all of `instance/` remain ignored.
+
+Set `MARKETPLACE_MOCK_MODE=false` only when you intend to use the preserved real eBay OAuth/Inventory API flow below. Local uploads are intentionally not public HTTPS URLs, so real publication rejects them. Use the secondary `/sandbox` development route with a suitable externally reachable HTTPS photo URL when exercising real eBay Sandbox.
 
 Generate secrets rather than copying the development fallback:
 
@@ -64,3 +68,7 @@ Each completed remote stage writes an explicit local state. If publishing fails 
 * **Timeout/remote error:** retries are safe after checking the displayed partial state. The HTTP timeout defaults to 15 seconds and can be changed with `EBAY_TIMEOUT_SECONDS`.
 
 The development lifecycle route returns 404 outside Sandbox, preventing this test tool from targeting production. Production support would require a separate reviewed UI and configuration rather than changing this guard.
+
+## Seller lifecycle failure policy
+
+“List Everywhere” calls only adapters present in the implementation registry (currently eBay); the application does not manufacture states or identifiers for other marketplaces. “Sold / Delist Everywhere” attempts withdrawal for every implemented marketplace whose item is published. It marks the local item `Sold` only after all withdrawals succeed. If any withdrawal fails, the item is not marked sold, safe structured details are persisted in `last_error`, and the seller sees an actionable failure rather than a false all-delisted message.
