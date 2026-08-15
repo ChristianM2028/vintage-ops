@@ -27,6 +27,9 @@ class Config:
     timeout: float = float(os.getenv("EBAY_TIMEOUT_SECONDS", "15"))
     marketplace_mock_mode: bool = env_bool("MARKETPLACE_MOCK_MODE", True)
     ebay_implementation: str = os.getenv("EBAY_IMPLEMENTATION", "api").strip().lower()
+    # Separate opt-in developer escape hatch; not a marketplace selector.
+    test_ebay_browser_flow: bool = env_bool("TEST_EBAY_BROWSER_FLOW", False)
+    ebay_browser_user_data_directory: str = os.getenv("EBAY_BROWSER_USER_DATA_DIRECTORY", "instance/ebay-browser-profile")
     automation_resolution_threshold: float = float(os.getenv("AUTOMATION_RESOLUTION_THRESHOLD", "0.80"))
     automation_resolution_margin: float = float(os.getenv("AUTOMATION_RESOLUTION_MARGIN", "0.15"))
     automation_classification_threshold: float = float(os.getenv("AUTOMATION_CLASSIFICATION_THRESHOLD", "0.85"))
