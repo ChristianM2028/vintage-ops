@@ -55,3 +55,46 @@ def test_mock_mode_can_be_disabled(tmp_path):
     app=create_app(Config(database_path=str(tmp_path/"real.sqlite"),marketplace_mock_mode=False))
     from integrations.ebay.service import EbayService
     assert isinstance(app.extensions["marketplace_adapters"]()["ebay"],EbayService)
+
+
+def test_storefront_catalog_detail_filters_and_safe_projection(tmp_path):
+    from app import create_app
+    app=create_app(Config(database_path=str(tmp_path/"shop.sqlite"),upload_directory=str(tmp_path/"uploads")))
+    app.testing=True; db=app.extensions["vintage_db"]; client=app.test_client()
+    active=db.create_item(**values("Indigo Chore Jacket")); db.update_item(active["id"],status="Active",storefront_visible=1)
+    cheap=db.create_item(**{**values("Canvas Shirt"),"description":"workwear staple","price":"8.00","brand":"Acme","size":"M"}); db.update_item(cheap["id"],status="Active",storefront_visible=1)
+    hidden=db.create_item(**values("Hidden Coat")); db.update_item(hidden["id"],status="Active")
+    sold=db.create_item(**values("Sold Treasure")); db.update_item(sold["id"],status="Sold",storefront_visible=1)
+
+    catalog=client.get("/shop")
+    assert catalog.status_code==200 and b"Indigo Chore Jacket" in catalog.data and b"Canvas Shirt" in catalog.data
+    assert b"Hidden Coat" not in catalog.data and b"Sold Treasure" not in catalog.data
+    filtered=client.get("/shop?q=workwear&brand=acme&size=m&min_price=5&max_price=10&sort=price_desc")
+    assert b"Canvas Shirt" in filtered.data and b"Indigo Chore Jacket" not in filtered.data
+    public=db.get_storefront_item_by_sku(active["sku"])
+    assert "id" not in public and all("id" not in photo for photo in public["photos"])
+
+    detail=client.get(f"/shop/item/{active['sku']}")
+    assert detail.status_code==200 and b"Indigo Chore Jacket" in detail.data and b"eBay lifecycle" not in detail.data
+    sold_detail=client.get(f"/shop/item/{sold['sku']}")
+    assert sold_detail.status_code==200 and b"Unavailable" in sold_detail.data
+    assert client.get(f"/shop/item/{hidden['sku']}").status_code==404
+    assert client.get("/shop/item/DOES-NOT-EXIST").status_code==404
+
+
+def test_storefront_validation_sorting_and_visibility_csrf(tmp_path):
+    from app import create_app
+    app=create_app(Config(database_path=str(tmp_path/"shop.sqlite"),upload_directory=str(tmp_path/"uploads")))
+    app.testing=True; db=app.extensions["vintage_db"]; client=app.test_client()
+    high=db.create_item(**{**values("High"),"price":"20.00"}); low=db.create_item(**{**values("Low"),"price":"5.00"})
+    for item in (high,low): db.update_item(item["id"],status="Active",storefront_visible=1)
+    response=client.get("/shop?sort=price_asc")
+    assert response.data.index(b"Low") < response.data.index(b"High")
+    for query in ("sort=bogus","min_price=-1","max_price=nope","min_price=9&max_price=2","unknown=x"):
+        assert client.get("/shop?"+query).status_code==400
+
+    assert client.post(f"/items/{high['id']}/storefront-visibility",data={"storefront_visible":"0"}).status_code==400
+    token=csrf(client)
+    changed=client.post(f"/items/{high['id']}/storefront-visibility",data={"csrf_token":token,"storefront_visible":"0"})
+    assert changed.status_code==302 and changed.headers["Location"].endswith(f"/items/{high['id']}")
+    assert db.get_item(high["id"])["storefront_visible"]==0
