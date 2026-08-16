@@ -33,7 +33,8 @@ def create_app(config=None, http=None):
     app.jinja_env.globals["csrf_token"]=csrf_token
     @app.before_request
     def csrf_protect():
-        if request.method=="POST" and not secrets.compare_digest(session.get("csrf_token", ""), request.form.get("csrf_token", "")): abort(400,"Invalid CSRF token")
+        expected=session.get("csrf_token")
+        if request.method=="POST" and (not expected or not secrets.compare_digest(expected, request.form.get("csrf_token", ""))): abort(400,"Invalid CSRF token")
 
     @app.route("/",methods=["GET","POST"])
     def home():
@@ -78,6 +79,37 @@ def create_app(config=None, http=None):
         status=request.args.get("status"); return render_template("inventory.html",items=db.inventory(status),statuses=STATUSES,selected=status)
     @app.get("/items/<int:item_id>")
     def item_page(item_id): return render_template("item.html",item=item_or_404(item_id),mock_mode=cfg.marketplace_mock_mode)
+    @app.get("/shop")
+    def shop():
+        allowed={"q","brand","size","min_price","max_price","sort"}
+        if set(request.args)-allowed: abort(400,"Unknown catalog parameter")
+        values={key: request.args.get(key,"").strip() for key in allowed}
+        if any(len(values[key])>100 for key in ("q","brand","size")): abort(400,"Catalog parameter is too long")
+        sort=values["sort"] or "newest"
+        if sort not in {"newest","price_asc","price_desc"}: abort(400,"Invalid sort")
+        prices={}
+        for key in ("min_price","max_price"):
+            if not values[key]: prices[key]=None; continue
+            try:
+                price=Decimal(values[key])
+                if not price.is_finite() or price < 0 or price.as_tuple().exponent < -2: raise InvalidOperation
+                prices[key]=price
+            except (InvalidOperation,ValueError): abort(400,f"Invalid {key.replace('_',' ')}")
+        if prices["min_price"] is not None and prices["max_price"] is not None and prices["min_price"]>prices["max_price"]: abort(400,"Minimum price exceeds maximum price")
+        items=db.storefront_catalog(values["q"] or None,values["brand"] or None,values["size"] or None,prices["min_price"],prices["max_price"],sort)
+        return render_template("shop_catalog.html",items=items,filters=values)
+    @app.get("/shop/item/<sku>")
+    def shop_item(sku):
+        item=db.get_storefront_item_by_sku(sku) or abort(404)
+        return render_template("shop_item.html",item=item)
+    @app.post("/items/<int:item_id>/storefront-visibility")
+    def storefront_visibility(item_id):
+        item_or_404(item_id)
+        visible=request.form.get("storefront_visible")
+        if visible not in {"0","1"}: abort(400,"Invalid storefront visibility")
+        db.update_item(item_id,storefront_visible=int(visible))
+        flash("Storefront visibility updated.","success")
+        return redirect(url_for("item_page",item_id=item_id))
     def run_action(item_id, operation, success):
         item=item_or_404(item_id)
         try: item=getattr(adapters()["ebay"],operation)(item); flash(success,"success")

@@ -52,6 +52,32 @@ class Database:
         if result: result["photos"]=[dict(x) for x in con.execute("SELECT * FROM item_photos WHERE item_id=? ORDER BY display_order,id",(item_id,))]
         if own: con.close()
         return result
+    @staticmethod
+    def _public_item(row, con):
+        """Return the deliberately small, ID-free representation used by the shop."""
+        item={key: row[key] for key in ("sku","title","description","price","currency","quantity","condition","brand","size","color","category","status","created_at")}
+        item["photos"]=[{"filename": p["filename"], "original_filename": p["original_filename"]} for p in con.execute("SELECT filename,original_filename FROM item_photos WHERE item_id=? ORDER BY display_order,id",(row["id"],))]
+        return item
+    def get_storefront_item_by_sku(self, sku):
+        """Look up a visible product by its public SKU without returning internal IDs."""
+        with self.connect() as con:
+            row=con.execute("SELECT * FROM items WHERE sku=? AND storefront_visible=1",(sku,)).fetchone()
+            return self._public_item(row,con) if row else None
+    def storefront_catalog(self, search=None, brand=None, size=None, min_price=None, max_price=None, sort="newest"):
+        """Query visible, active inventory and return only storefront-safe fields."""
+        clauses=["storefront_visible=1","status='Active'"]; args=[]
+        if search:
+            clauses.append("(LOWER(title) LIKE ? OR LOWER(description) LIKE ? OR LOWER(COALESCE(brand,'')) LIKE ?)")
+            term=f"%{search.lower()}%"; args.extend((term,term,term))
+        if brand: clauses.append("LOWER(COALESCE(brand,''))=LOWER(?)"); args.append(brand)
+        if size: clauses.append("LOWER(COALESCE(size,''))=LOWER(?)"); args.append(size)
+        if min_price is not None: clauses.append("CAST(price AS NUMERIC)>=?"); args.append(str(min_price))
+        if max_price is not None: clauses.append("CAST(price AS NUMERIC)<=?"); args.append(str(max_price))
+        orders={"newest":"created_at DESC,id DESC","price_asc":"CAST(price AS NUMERIC) ASC,id DESC","price_desc":"CAST(price AS NUMERIC) DESC,id DESC"}
+        if sort not in orders: raise ValueError("Invalid storefront sort")
+        with self.connect() as con:
+            rows=con.execute("SELECT * FROM items WHERE "+" AND ".join(clauses)+" ORDER BY "+orders[sort],args).fetchall()
+            return [self._public_item(row,con) for row in rows]
     def inventory(self, status=None):
         with self.connect() as c:
             sql="SELECT * FROM items"; args=[]
@@ -60,7 +86,7 @@ class Database:
             return [self.get_item(r["id"],c) for r in rows]
     def get_photos(self,item_id): return (self.get_item(item_id) or {}).get("photos",[])
     def update_item(self,item_id,**values):
-        allowed={"title","description","price","currency","quantity","condition","brand","size","color","category","photo_urls","ebay_sku","ebay_offer_id","ebay_listing_id","ebay_publication_state","last_error","status"}
+        allowed={"title","description","price","currency","quantity","condition","brand","size","color","category","photo_urls","ebay_sku","ebay_offer_id","ebay_listing_id","ebay_publication_state","last_error","status","storefront_visible"}
         if not values: return self.get_item(item_id)
         if set(values)-allowed: raise ValueError("Unsupported item field")
         values["updated_at"]=now()
