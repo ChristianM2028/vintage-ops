@@ -1,5 +1,13 @@
 import os
 from dataclasses import dataclass
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+
+DOTENV_PATH = Path(__file__).resolve().parent / ".env"
+load_dotenv(dotenv_path=DOTENV_PATH, override=False)
+
 
 def env_bool(name, default=True):
     value = os.getenv(name)
