@@ -30,3 +30,7 @@ class Config:
     max_upload_size: int = int(os.getenv("MAX_UPLOAD_SIZE", str(8 * 1024 * 1024)))
     permitted_image_extensions: tuple = tuple(x.strip().lower().lstrip(".") for x in os.getenv("PERMITTED_IMAGE_EXTENSIONS", "jpg,jpeg,png,gif,webp").split(",") if x.strip())
     max_photo_count: int = int(os.getenv("MAX_PHOTO_COUNT", "10"))
+    media_public_base_url: str = os.getenv("MEDIA_PUBLIC_BASE_URL", "")
+    media_upload_url: str = os.getenv("MEDIA_UPLOAD_URL", "")
+    media_upload_token: str = os.getenv("MEDIA_UPLOAD_TOKEN", "")
+    metadata_cache_seconds: int = int(os.getenv("EBAY_METADATA_CACHE_SECONDS", "86400"))

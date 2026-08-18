@@ -13,5 +13,9 @@ class MockEbayAdapter:
         if item.get("ebay_publication_state") == "withdrawn": return item
         status="Sold" if item.get("status")=="Sold" else "Delisted"
         return self.db.update_marketplace(item["id"],ebay_publication_state="withdrawn",status=status,last_error=None)
+    def update(self,item):
+        if not item.get("ebay_offer_id"): raise EbayError("conflict","List the item before synchronizing edits")
+        return self.db.update_marketplace(item["id"],ebay_sync_state="synchronized",last_error=None)
+    def synchronize(self,item): return self.db.update_marketplace(item["id"],ebay_sync_state=item.get("ebay_publication_state") or "not_listed",last_error=None)
     listItem = list
     delistItem = delist

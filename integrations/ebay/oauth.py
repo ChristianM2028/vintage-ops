@@ -7,7 +7,8 @@ from db import now
 
 SCOPES=("https://api.ebay.com/oauth/api_scope "
         "https://api.ebay.com/oauth/api_scope/sell.inventory "
-        "https://api.ebay.com/oauth/api_scope/sell.account")
+        "https://api.ebay.com/oauth/api_scope/sell.account "
+        "https://api.ebay.com/oauth/api_scope/sell.fulfillment")
 
 class OAuthManager:
     def __init__(self, config, db, session):
@@ -20,6 +21,8 @@ class OAuthManager:
     def _require_crypto(self):
         if not self.fernet: raise EbayError("configuration","TOKEN_ENCRYPTION_KEY is required; generate a Fernet key")
     def begin(self):
+        missing=[name for name,value in (("EBAY_CLIENT_ID",self.cfg.client_id),("EBAY_CLIENT_SECRET",self.cfg.client_secret),("EBAY_RUNAME",self.cfg.runame),("TOKEN_ENCRYPTION_KEY",self.cfg.encryption_key)) if not value]
+        if missing: raise EbayError("configuration","Configure "+", ".join(missing)+" before connecting the seller")
         state=secrets.token_urlsafe(32); digest=hashlib.sha256(state.encode()).hexdigest()
         expiry=(datetime.now(timezone.utc)+timedelta(minutes=10)).isoformat()
         with self.db.transaction() as c: c.execute("INSERT INTO oauth_states(state_hash,expires_at) VALUES (?,?)",(digest,expiry))
@@ -46,7 +49,9 @@ class OAuthManager:
     def access_token(self):
         self._require_crypto()
         with self.db.connect() as c: row=c.execute("SELECT * FROM ebay_tokens WHERE id=1").fetchone()
-        if not row: raise EbayError("authentication","Seller is not authorized; connect the Sandbox seller")
+        if not row: raise EbayError("authentication","Seller is not authorized; connect the eBay seller")
+        granted=set((row["scopes"] or "").split()); required=set(SCOPES.split())
+        if not required.issubset(granted): raise EbayError("reauthorization_required","Seller authorization is missing required Inventory, Account, or Fulfillment permissions; reconnect the seller")
         dec=lambda value:self.fernet.decrypt(value).decode() if value else None
         try: access=dec(row["access_token_encrypted"]); refresh=dec(row["refresh_token_encrypted"])
         except InvalidToken: raise EbayError("configuration","Stored seller token cannot be decrypted with TOKEN_ENCRYPTION_KEY")

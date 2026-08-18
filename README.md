@@ -72,3 +72,19 @@ The development lifecycle route returns 404 outside Sandbox, preventing this tes
 ## Seller lifecycle failure policy
 
 “List Everywhere” calls only adapters present in the implementation registry (currently eBay); the application does not manufacture states or identifiers for other marketplaces. “Sold / Delist Everywhere” attempts withdrawal for every implemented marketplace whose item is published. It marks the local item `Sold` only after all withdrawals succeed. If any withdrawal fails, the item is not marked sold, safe structured details are persisted in `last_error`, and the seller sees an actionable failure rather than a false all-delisted message.
+
+## Production eBay checklist
+
+Production requires a separate production keyset and an authorized production seller. Configure the production App ID as `EBAY_CLIENT_ID`, production Cert ID as `EBAY_CLIENT_SECRET`, the registered OAuth redirect identifier (RuName) as `EBAY_RUNAME`, and its **exact registered callback URL** as `EBAY_CALLBACK_URL`. Set `EBAY_ENVIRONMENT=production` and `MARKETPLACE_MOCK_MODE=false`. Keep stable, randomly generated `FLASK_SECRET_KEY` and Fernet `TOKEN_ENCRYPTION_KEY` values.
+
+Set `EBAY_MARKETPLACE_ID` and `EBAY_CURRENCY`, an enabled `EBAY_MERCHANT_LOCATION_KEY`, and fulfillment, payment, and return policy IDs owned by the same seller and marketplace. The seller must have production selling privileges, be enrolled in Business Policies, and authorize the base, Inventory, Account, and Fulfillment scopes. Existing grants made before Fulfillment was added must be reauthorized.
+
+Local Flask URLs are never used as production image URLs. Configure an HTTPS content-addressable upload service with `MEDIA_UPLOAD_URL` and its public retrieval origin with `MEDIA_PUBLIC_BASE_URL`; set `MEDIA_UPLOAD_TOKEN` when the service requires a bearer credential. The origin must make each uploaded image durably and anonymously retrievable over HTTPS in a format accepted by eBay.
+
+Vintage Ops uses scheduled Fulfillment API reconciliation rather than browser automation. Invoke the seller reconciliation action periodically and ensure the production account has the Fulfillment grant. If notifications are added, separately configure the eBay notification destination/account challenge-response requirements; notifications do not remove the need for idempotent order-line processing.
+
+The integration follows the official eBay REST resources: Taxonomy category trees/suggestions/aspects, Metadata condition policies, Inventory create-or-replace inventory item and offer lifecycle methods, and Fulfillment `getOrders`. Metadata is cached for `EBAY_METADATA_CACHE_SECONDS`; a cached value remains usable during a transient refresh failure so seller edits are not discarded.
+
+### Order-state policy
+
+Fulfillment reconciliation records every `(orderId, lineItemId)` once. A `PAID` line decrements quantity atomically and hides zero-stock items immediately. Pending/failed payment is recorded but does not reserve or decrement local stock. Cancellation and refund data is retained for audit and synchronization, but Vintage Ops does not automatically relist or increase stock because return disposition may be unknown; the seller reviews and edits inventory explicitly. Multi-quantity paid lines decrement by the reported quantity, and unknown SKUs/listing IDs are retained and counted for manual resolution.
