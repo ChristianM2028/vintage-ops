@@ -9,6 +9,7 @@ from db import Database, STATUSES
 from integrations.ebay import EbayService, MockEbayAdapter, EbayError
 from integrations.ebay.client import EbayClient
 from integrations.ebay.oauth import OAuthManager
+from integrations.ebay.photos import PhotoPublisher
 
 IMAGE_SIGNATURES={"jpg":lambda b:b.startswith(b"\xff\xd8\xff"),"jpeg":lambda b:b.startswith(b"\xff\xd8\xff"),"png":lambda b:b.startswith(b"\x89PNG\r\n\x1a\n"),"gif":lambda b:b.startswith((b"GIF87a",b"GIF89a")),"webp":lambda b:len(b)>=12 and b[:4]==b"RIFF" and b[8:12]==b"WEBP"}
 
@@ -112,19 +113,62 @@ def create_app(config=None, http=None):
         return redirect(url_for("item_page",item_id=item_id))
     def run_action(item_id, operation, success):
         item=item_or_404(item_id)
-        try: item=getattr(adapters()["ebay"],operation)(item); flash(success,"success")
+        try:
+            if operation in ("list","update") and not cfg.marketplace_mock_mode and item.get("photos"):
+                PhotoPublisher(cfg,db,http_session).publish(item); item=db.get_item(item_id)
+            item=getattr(adapters()["ebay"],operation)(item); flash(success,"success")
         except EbayError as e: db.update_item(item_id,last_error=json.dumps(e.safe_dict())); flash(str(e),"error")
         return redirect(url_for("item_page",item_id=item_id))
     @app.post("/items/<int:item_id>/list-ebay")
     def list_ebay(item_id): return run_action(item_id,"list","Listed on eBay.")
     @app.post("/items/<int:item_id>/delist-ebay")
     def delist_ebay(item_id): return run_action(item_id,"delist","Delisted from eBay.")
+    @app.post("/items/<int:item_id>/sync-ebay")
+    def sync_ebay(item_id): return run_action(item_id,"synchronize","eBay state synchronized.")
+    @app.post("/items/<int:item_id>/update-ebay")
+    def update_ebay(item_id): return run_action(item_id,"update","Edits synchronized to eBay.")
+    @app.route("/items/<int:item_id>/edit",methods=["GET","POST"])
+    def edit_item(item_id):
+        item=item_or_404(item_id); values=dict(item); errors=[]
+        if request.method=="POST":
+            values.update(request.form.to_dict())
+            for field in ("title","description","price","quantity","condition","category"):
+                if not request.form.get(field,"").strip(): errors.append(f"{field.title()} is required.")
+            try:
+                price=Decimal(request.form.get("price","")); quantity=int(request.form.get("quantity",""))
+                if price<=0 or price.as_tuple().exponent < -2 or quantity<0: raise ValueError
+            except (ValueError,InvalidOperation): errors.append("Price and quantity must be valid non-negative values.")
+            try:
+                specifics=json.loads(request.form.get("item_specifics","{}"))
+                if not isinstance(specifics,dict): raise ValueError
+            except (ValueError,json.JSONDecodeError): errors.append("Item specifics must be a JSON object."); specifics={}
+            replacement=[]; saved=[]
+            files=[f for f in request.files.getlist("photos") if f and f.filename]
+            if len(files)>cfg.max_photo_count: errors.append(f"You may upload at most {cfg.max_photo_count} photos.")
+            for f in files:
+                ext=Path(f.filename).suffix.lower().lstrip("."); data=f.read(cfg.max_upload_size+1)
+                if ext not in cfg.permitted_image_extensions or ext not in IMAGE_SIGNATURES or not IMAGE_SIGNATURES[ext](data): errors.append(f"{f.filename}: invalid image type."); continue
+                if len(data)>cfg.max_upload_size: errors.append(f"{f.filename}: image is too large."); continue
+                replacement.append({"filename":f"{secrets.token_hex(20)}.{ext}","original_filename":Path(f.filename).name,"data":data})
+            if not errors:
+                try:
+                    for p in replacement: (upload_dir/p["filename"]).write_bytes(p.pop("data")); saved.append(upload_dir/p["filename"])
+                    db.update_item_and_photos(item_id,{"title":request.form["title"].strip(),"description":request.form["description"].strip(),"price":f"{price:.2f}","quantity":quantity,"condition":request.form["condition"].strip(),"category":request.form["category"].strip(),"brand":request.form.get("brand","").strip(),"size":request.form.get("size","").strip(),"color":request.form.get("color","").strip(),"item_specifics":specifics},replacement or None)
+                    flash("Edits saved. Synchronize to apply them to eBay.","success"); return redirect(url_for("item_page",item_id=item_id))
+                except Exception:
+                    for path in saved: path.unlink(missing_ok=True)
+                    errors.append("The edit could not be saved; replacement uploads were cleaned up.")
+            for error in errors: flash(error,"error")
+        return render_template("edit_item.html",item=item,values=values,specifics=json.dumps(item.get("item_specifics",{}),indent=2))
     @app.post("/items/<int:item_id>/list-everywhere")
     def list_everywhere(item_id):
         # The registry intentionally contains implemented adapters only.
         item=item_or_404(item_id)
         try:
-            for adapter in adapters().values(): item=adapter.list(item)
+            for adapter in adapters().values():
+                if adapter.name=="ebay" and not cfg.marketplace_mock_mode and item.get("photos"):
+                    PhotoPublisher(cfg,db,http_session).publish(item); item=db.get_item(item_id)
+                item=adapter.list(item)
             flash("Listed on every configured marketplace (eBay).","success")
         except EbayError as e: db.update_item(item_id,last_error=json.dumps(e.safe_dict())); flash("Not all marketplaces were listed: "+str(e),"error")
         return redirect(url_for("item_page",item_id=item_id))
@@ -147,15 +191,28 @@ def create_app(config=None, http=None):
     def authorize():
         oauth,_=real_components()
         try: url,_=oauth.begin(); return redirect(url)
-        except EbayError as e: flash(str(e),"error"); return redirect(url_for("sandbox"))
+        except EbayError as e: flash(str(e),"error"); return redirect(url_for("ebay_settings"))
     @app.get("/ebay/callback")
     def callback():
         oauth,_=real_components()
         try:
             if request.args.get("error"): raise EbayError("authentication",f"eBay authorization was declined: {request.args.get('error_description') or request.args['error']}")
-            oauth.validate_state(request.args.get("state")); oauth.exchange_code(request.args.get("code","")); flash("Sandbox seller connected","success")
+            oauth.validate_state(request.args.get("state")); oauth.exchange_code(request.args.get("code","")); flash("eBay seller connected","success")
         except EbayError as e: flash(str(e),"error")
-        return redirect(url_for("sandbox"))
+        return redirect(url_for("ebay_settings"))
+    @app.get("/ebay/settings")
+    def ebay_settings():
+        oauth,_=real_components(); authenticated=False; auth_error=None
+        try: oauth.access_token(); authenticated=True
+        except EbayError as e: auth_error=e.safe_dict()
+        return render_template("ebay_settings.html",cfg=cfg,authenticated=authenticated,auth_error=auth_error)
+    @app.post("/ebay/reconcile-orders")
+    def reconcile_orders():
+        try:
+            result=adapters()["ebay"].reconcile_orders() if not cfg.marketplace_mock_mode else {"processed":0,"duplicate":0,"unknown":0}
+            flash(f"Order reconciliation complete: {result}","success")
+        except EbayError as e: flash(str(e),"error")
+        return redirect(url_for("ebay_settings"))
     @app.route("/sandbox",methods=["GET","POST"])
     def sandbox():
         if cfg.environment != "sandbox": abort(404)

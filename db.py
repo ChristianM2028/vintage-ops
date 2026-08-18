@@ -1,4 +1,4 @@
-import json, os, sqlite3
+import json, os, sqlite3, secrets
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -49,7 +49,9 @@ class Database:
     def get_item(self, item_id, con=None):
         own=con is None; con=con or self.connect(); row=con.execute("SELECT * FROM items WHERE id=?",(item_id,)).fetchone()
         result=dict(row) if row else None
-        if result: result["photos"]=[dict(x) for x in con.execute("SELECT * FROM item_photos WHERE item_id=? ORDER BY display_order,id",(item_id,))]
+        if result:
+            result["photos"]=[dict(x) for x in con.execute("SELECT * FROM item_photos WHERE item_id=? ORDER BY display_order,id",(item_id,))]
+            result["item_specifics"]=json.loads(result.get("item_specifics") or "{}")
         if own: con.close()
         return result
     @staticmethod
@@ -86,9 +88,11 @@ class Database:
             return [self.get_item(r["id"],c) for r in rows]
     def get_photos(self,item_id): return (self.get_item(item_id) or {}).get("photos",[])
     def update_item(self,item_id,**values):
-        allowed={"title","description","price","currency","quantity","condition","brand","size","color","category","photo_urls","ebay_sku","ebay_offer_id","ebay_listing_id","ebay_publication_state","last_error","status","storefront_visible"}
+        allowed={"title","description","price","currency","quantity","condition","brand","size","color","category","photo_urls","item_specifics","ebay_sku","ebay_offer_id","ebay_listing_id","ebay_publication_state","ebay_sync_state","local_revision","synced_revision","publication_lock_token","publication_lock_expires_at","last_error","status","storefront_visible"}
         if not values: return self.get_item(item_id)
         if set(values)-allowed: raise ValueError("Unsupported item field")
+        for key in ("photo_urls","item_specifics"):
+            if key in values and not isinstance(values[key],str): values[key]=json.dumps(values[key])
         values["updated_at"]=now()
         with self.transaction() as c: c.execute("UPDATE items SET "+",".join(f"{k}=?" for k in values)+" WHERE id=?",[*values.values(),item_id])
         return self.get_item(item_id)
@@ -101,3 +105,38 @@ class Database:
             con.execute("UPDATE items SET status=?,updated_at=? WHERE id=?",(status,now(),item_id)); return self.get_item(item_id,con)
         return self.update_item(item_id,status=status)
     def update_marketplace(self,item_id,**values): return self.update_item(item_id,**values)
+    def update_photo_publication(self,photo_id,url,fingerprint,error):
+        with self.transaction() as c: c.execute("UPDATE item_photos SET remote_url=?,source_fingerprint=?,publication_error=?,updated_at=? WHERE id=?",(url,fingerprint,error,now(),photo_id))
+    def update_item_and_photos(self,item_id,values,photos=None):
+        """Atomically accept canonical edits and optional replacement photo rows."""
+        allowed={"title","description","price","quantity","condition","category","brand","size","color","item_specifics"}
+        if set(values)-allowed: raise ValueError("Unsupported editable item field")
+        stamp=now(); values=dict(values); values["item_specifics"]=json.dumps(values.get("item_specifics",{}))
+        with self.transaction(immediate=True) as c:
+            c.execute("UPDATE items SET "+",".join(f"{k}=?" for k in values)+",local_revision=local_revision+1,ebay_sync_state=?,updated_at=? WHERE id=?",[*values.values(),"pending",stamp,item_id])
+            if photos is not None:
+                c.execute("DELETE FROM item_photos WHERE item_id=?",(item_id,))
+                for order,p in enumerate(photos): c.execute("INSERT INTO item_photos(item_id,filename,original_filename,display_order,created_at,updated_at) VALUES(?,?,?,?,?,?)",(item_id,p["filename"],p["original_filename"],order,stamp,stamp))
+            return self.get_item(item_id,c)
+    def acquire_publication_lock(self,item_id,seconds=120):
+        from datetime import timedelta
+        token=secrets.token_urlsafe(24); expiry=(datetime.now(timezone.utc)+timedelta(seconds=seconds)).isoformat()
+        with self.transaction(immediate=True) as c:
+            row=c.execute("SELECT publication_lock_token,publication_lock_expires_at FROM items WHERE id=?",(item_id,)).fetchone()
+            if row["publication_lock_token"] and row["publication_lock_expires_at"] and row["publication_lock_expires_at"]>now(): return None
+            c.execute("UPDATE items SET publication_lock_token=?,publication_lock_expires_at=? WHERE id=?",(token,expiry,item_id))
+        return token
+    def release_publication_lock(self,item_id,token):
+        with self.transaction() as c: c.execute("UPDATE items SET publication_lock_token=NULL,publication_lock_expires_at=NULL WHERE id=? AND publication_lock_token=?",(item_id,token))
+    def process_order_line(self,order_id,line_id,sku,listing_id,quantity,payment,fulfillment,raw):
+        """Deduplicate an order line and atomically reduce immediately-visible stock."""
+        with self.transaction(immediate=True) as c:
+            if c.execute("SELECT 1 FROM ebay_order_lines WHERE order_id=? AND line_item_id=?",(order_id,line_id)).fetchone(): return False
+            c.execute("INSERT INTO ebay_order_lines(order_id,line_item_id,sku,listing_id,quantity,payment_state,fulfillment_state,raw_payload,processed_at) VALUES(?,?,?,?,?,?,?,?,?)",(order_id,line_id,sku,listing_id,quantity,payment,fulfillment,json.dumps(raw),now()))
+            if payment not in ("PAID","FULLY_REFUNDED"):
+                return True
+            row=c.execute("SELECT * FROM items WHERE ebay_sku=? OR ebay_listing_id=?",(sku,listing_id)).fetchone()
+            if row and payment=="PAID":
+                remaining=max(0,row["quantity"]-quantity); status="Sold" if remaining==0 else row["status"]
+                c.execute("UPDATE items SET quantity=?,status=?,storefront_visible=?,ebay_sync_state='sold',updated_at=? WHERE id=?",(remaining,status,0 if remaining==0 else row["storefront_visible"],now(),row["id"]))
+            return True
