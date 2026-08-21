@@ -36,19 +36,23 @@ Put those values in `FLASK_SECRET_KEY` and `TOKEN_ENCRYPTION_KEY`. The latter mu
 
 See eBay's official [authorization-code grant](https://developer.ebay.com/api-docs/static/oauth-authorization-code-grant.html), [OAuth scopes](https://developer.ebay.com/api-docs/static/oauth-scopes.html), and [token endpoint](https://developer.ebay.com/api-docs/static/oauth-token-types.html) documentation.
 
-## Seller prerequisites (do not guess values)
+## Automatic Sandbox seller setup
 
-Before listing, confirm the Sandbox seller is eligible for the Inventory API and has selling privileges:
+After authorizing the Sandbox seller, open `/sandbox` and click **Set up Sandbox seller**. The setup is deliberately restricted to `EBAY_ENVIRONMENT=sandbox` and `EBAY_US`. It uses the seller OAuth grant to:
 
-* Opt in to Business Policies and create fulfillment, payment, and return policies. Retrieve their IDs with Account API `getFulfillmentPolicies`, `getPaymentPolicies`, and `getReturnPolicies`, or copy IDs created in Seller Hub. Supply them in `.env` or the Sandbox form. See the official [Account API](https://developer.ebay.com/api-docs/sell/account/overview.html).
-* Create and enable a merchant inventory location with Inventory API `createInventoryLocation`/`enableInventoryLocation`; supply its exact key. A location cannot be invented. See [Inventory locations](https://developer.ebay.com/api-docs/sell/inventory/resources/location/methods/createInventoryLocation).
-* Set the intended marketplace and its currency (for example `EBAY_US`/`USD`). Ensure every policy is for that marketplace.
+* inspect the Account API `SELLING_POLICY_MANAGEMENT` privilege and opt in only when needed;
+* reuse distinctively named Vintage Ops fulfillment, payment, and return policies, or create sensible Sandbox defaults and confirm them by querying again; and
+* reuse `vintage-ops-main`, or create the US warehouse location and enable it when needed.
+
+The four resulting identifiers are persisted for the authorized setup (an API-provided seller identity is stored when eBay supplies one); OAuth credentials are never part of this record. Repeated submissions re-query and reuse the same resources. Do not manually copy policy IDs from Seller Hub or enter location/policy values in the form. See the official [Account API](https://developer.ebay.com/api-docs/sell/account/overview.html) and [Inventory locations](https://developer.ebay.com/api-docs/sell/inventory/resources/location/methods/createInventoryLocation).
+
+The remaining per-item prerequisites still come from eBay's category contracts:
 * Find an appropriate **leaf** clothing category through Taxonomy API `getCategorySuggestions`/category tree calls. Check category aspects and accepted conditions through Taxonomy and Metadata APIs. Enter the actual category ID and Inventory API condition enum; the example intentionally does not pretend a value is universally valid. See [Taxonomy API](https://developer.ebay.com/api-docs/commerce/taxonomy/overview.html) and [Metadata API](https://developer.ebay.com/api-docs/sell/metadata/overview.html).
 * Provide externally reachable public HTTPS image URLs. URLs requiring cookies/authentication, local URLs, placeholders, and unsupported image content will be rejected. Review eBay's [Inventory item method](https://developer.ebay.com/api-docs/sell/inventory/resources/inventory_item/methods/createOrReplaceInventoryItem) requirements.
 
 ## Lifecycle and recovery
 
-The Sandbox form makes an obviously fake local garment, accepts verified category/condition/location/policy values, then performs the official Inventory API sequence:
+The Sandbox form makes an obviously fake local garment and uses the persisted automatic setup values, then performs the official Inventory API sequence:
 
 1. `PUT /sell/inventory/v1/inventory_item/{sku}` creates or replaces inventory. The stable local SKU is persisted as the eBay SKU first.
 2. `POST /sell/inventory/v1/offer` creates the fixed-price offer. Its ID is persisted **immediately**.
@@ -61,7 +65,7 @@ Each completed remote stage writes an explicit local state. If publishing fails 
 ## Troubleshooting
 
 * **Not authorized / reauthorization required:** authorize again; verify App ID, Cert ID, RuName, and exact accepted callback URL. Changing the encryption key makes existing tokens unreadable and requires reauthorization.
-* **Missing prerequisite:** fill every policy/location/category value with data belonging to the same Sandbox seller and marketplace; ensure the location is enabled and business policies are opted in.
+* **Missing prerequisite:** run **Set up Sandbox seller**, then supply a valid leaf category and condition for the fake item.
 * **Invalid item:** validate leaf category, condition, required aspects, currency, quantity, and public HTTPS photos against the category metadata.
 * **Conflict / relist required:** eBay restricts edits based on offer/listing state. Withdraw before changing locked data, then relist.
 * **Partial publication:** keep the saved SKU/offer ID and use retry. The structured error on the item page includes safe error IDs, domain, category, parameters, and eBay request/correlation ID without tokens.

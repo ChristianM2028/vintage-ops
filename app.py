@@ -6,7 +6,7 @@ from flask import Flask, abort, flash, redirect, render_template, request, send_
 import requests
 from config import Config
 from db import Database, STATUSES
-from integrations.ebay import EbayService, MockEbayAdapter, EbayError
+from integrations.ebay import EbayService, MockEbayAdapter, EbayError, SandboxSellerSetup
 from integrations.ebay.client import EbayClient
 from integrations.ebay.oauth import OAuthManager
 from integrations.ebay.photos import PhotoPublisher
@@ -221,11 +221,28 @@ def create_app(config=None, http=None):
         except EbayError: pass
         if request.method=="POST":
             item=db.create_item(title=request.form["title"],description=request.form["description"],price=request.form["price"],currency=cfg.currency,quantity=1,condition=request.form["condition"],brand=request.form["brand"],size=request.form["size"],color=request.form["color"],category=request.form["category"],photo_urls=[request.form["photo_url"]])
-            overrides={k:request.form[k] for k in ("location_key","fulfillment_policy_id","payment_policy_id","return_policy_id") if request.form.get(k)}
+            setup=db.get_seller_setup()
+            if not setup:
+                flash("Set up the Sandbox seller before listing an item.","error")
+                return redirect(url_for("sandbox"))
+            overrides={"location_key":setup["merchant_location_key"], "fulfillment_policy_id":setup["fulfillment_policy_id"],
+                       "payment_policy_id":setup["payment_policy_id"], "return_policy_id":setup["return_policy_id"],
+                       "marketplace_id":setup["marketplace"]}
             try: real_components(overrides)[1].list(item); flash("Fake item published to eBay Sandbox","success")
             except EbayError as e: flash(json.dumps(e.safe_dict()),"error")
             return redirect(url_for("item_page",item_id=item["id"]))
-        return render_template("sandbox.html",cfg=cfg,authenticated=authenticated)
+        return render_template("sandbox.html",cfg=cfg,authenticated=authenticated,setup=db.get_seller_setup())
+    @app.post("/sandbox/setup")
+    def sandbox_setup():
+        if cfg.environment != "sandbox": abort(404)
+        oauth,service=real_components()
+        try:
+            oauth.access_token()  # Explicitly require an authenticated seller.
+            setup=SandboxSellerSetup(cfg,db,service.client).run()
+            flash("Sandbox seller setup is ready.","success")
+        except EbayError as error:
+            flash(json.dumps(error.safe_dict()),"error")
+        return redirect(url_for("sandbox"))
     app.extensions.update(vintage_db=db,ebay_components=real_components,marketplace_adapters=adapters)
     return app
 

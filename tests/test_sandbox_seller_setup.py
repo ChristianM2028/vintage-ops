@@ -1,0 +1,80 @@
+from dataclasses import replace
+
+import pytest
+
+from config import Config
+from db import Database
+from integrations.ebay.errors import EbayError
+from integrations.ebay.seller_setup import SandboxSellerSetup
+
+
+class FakeClient:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def request(self, method, path, **kwargs):
+        self.calls.append((method, path, kwargs))
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+def policy(kind, identifier):
+    names = {"fulfillment": "Vintage Ops Sandbox Fulfillment",
+             "payment": "Vintage Ops Sandbox Payment", "return": "Vintage Ops Sandbox Returns"}
+    return {"name": names[kind], "marketplaceId": "EBAY_US", kind + "PolicyId": identifier}
+
+
+def test_initial_setup_exact_contract_payloads_and_persistence(tmp_path):
+    cfg = Config(database_path=str(tmp_path / "setup.sqlite"), marketplace_id="EBAY_US", environment="sandbox")
+    db = Database(cfg.database_path); db.migrate()
+    responses = [{"privileges": [{"privilegeType": "SELLING_POLICY_MANAGEMENT", "enabled": False}], "sellerId": "seller-1"}, {}]
+    for kind, identifier in (("fulfillment", "F1"), ("payment", "P1"), ("return", "R1")):
+        responses += [{kind + "Policies": []}, {}, {kind + "Policies": [policy(kind, identifier)]}]
+    responses += [{"locations": []}, {}, {"locations": [{"merchantLocationKey": "vintage-ops-main", "merchantLocationStatus": "DISABLED"}]}, {}]
+    client = FakeClient(responses)
+
+    saved = SandboxSellerSetup(cfg, db, client).run()
+
+    assert (saved["seller_id"], saved["fulfillment_policy_id"], saved["payment_policy_id"],
+            saved["return_policy_id"], saved["merchant_location_key"], saved["marketplace"]) == (
+                "seller-1", "F1", "P1", "R1", "vintage-ops-main", "EBAY_US")
+    assert client.calls[1] == ("POST", "/sell/account/v1/program/opt_in",
+                               {"json": {"programType": "SELLING_POLICY_MANAGEMENT"}, "expected": (204,)})
+    creates = {(method, path): kwargs["json"] for method, path, kwargs in client.calls if "json" in kwargs and "_policy" in path}
+    assert creates[("POST", "/sell/account/v1/payment_policy")] == {
+        "name": "Vintage Ops Sandbox Payment", "marketplaceId": "EBAY_US",
+        "categoryTypes": [{"name": "ALL_EXCLUDING_MOTORS_VEHICLES", "default": True}]}
+    location = next(c for c in client.calls if c[1] == "/sell/inventory/v1/location/vintage-ops-main")
+    assert location == ("POST", "/sell/inventory/v1/location/vintage-ops-main", {"json": {
+        "location": {"address": {"addressLine1": "2025 Hamilton Avenue", "city": "San Jose",
+            "stateOrProvince": "CA", "postalCode": "95125", "country": "US"}},
+        "locationTypes": ["WAREHOUSE"], "name": "Vintage Ops Sandbox Main"}, "expected": (204,)})
+    assert client.calls[-1][:2] == ("POST", "/sell/inventory/v1/location/vintage-ops-main/enable")
+
+
+def test_reuses_existing_resources_without_writes(tmp_path):
+    cfg = Config(database_path=str(tmp_path / "reuse.sqlite"), marketplace_id="EBAY_US", environment="sandbox")
+    db = Database(cfg.database_path); db.migrate()
+    responses = [{"privileges": [{"privilegeType": "SELLING_POLICY_MANAGEMENT", "enabled": True}]}]
+    responses += [{kind + "Policies": [policy(kind, identifier)]} for kind, identifier in
+                  (("fulfillment", "F"), ("payment", "P"), ("return", "R"))]
+    responses += [{"locations": [{"merchantLocationKey": "vintage-ops-main", "merchantLocationStatus": "ENABLED"}]}]
+    client = FakeClient(responses)
+    SandboxSellerSetup(cfg, db, client).run()
+    assert all(method == "GET" for method, _, _ in client.calls)
+    assert [path for _, path, _ in client.calls] == ["/sell/account/v1/privilege",
+        "/sell/account/v1/fulfillment_policy?marketplace_id=EBAY_US",
+        "/sell/account/v1/payment_policy?marketplace_id=EBAY_US",
+        "/sell/account/v1/return_policy?marketplace_id=EBAY_US",
+        "/sell/inventory/v1/location?limit=200"]
+
+
+def test_environment_and_marketplace_guards(tmp_path):
+    db = Database(str(tmp_path / "guard.sqlite")); db.migrate()
+    with pytest.raises(EbayError):
+        SandboxSellerSetup(Config(environment="production"), db, FakeClient([])).run()
+    with pytest.raises(EbayError):
+        SandboxSellerSetup(Config(environment="sandbox", marketplace_id="EBAY_GB"), db, FakeClient([])).run()
