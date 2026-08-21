@@ -83,29 +83,25 @@ class SandboxSellerSetup:
         return common
 
     def _location(self):
-        path = "/sell/inventory/v1/location"
-        data = self.client.request("GET", path + "?limit=200")
-        matches = [x for x in data.get("locations", []) if x.get("merchantLocationKey") == LOCATION_KEY]
-        if len(matches) > 1:
-            raise EbayError("manual_resolution", "Multiple inventory locations use vintage-ops-main")
-        if not matches:
+        path = f"/sell/inventory/v1/location/{quote(LOCATION_KEY, safe='')}"
+        try:
+            location = self.client.request("GET", path)
+        except EbayError as error:
+            if error.status != 404:
+                raise
             payload = {
                 "location": {"address": {"addressLine1": "2025 Hamilton Avenue", "city": "San Jose",
                     "stateOrProvince": "CA", "postalCode": "95125", "country": "US"}},
                 "locationTypes": ["WAREHOUSE"], "name": "Vintage Ops Sandbox Main",
             }
             try:
-                self.client.request("POST", f"{path}/{quote(LOCATION_KEY, safe='')}", json=payload, expected=(204,))
-            except EbayError as error:
+                self.client.request("POST", path, json=payload, expected=(204,))
+            except EbayError as create_error:
                 # The key makes create naturally idempotent; confirm an uncertain
                 # or racing create rather than issuing a second create request.
-                if error.kind not in ("remote", "conflict"):
+                if create_error.kind not in ("remote", "conflict"):
                     raise
-            data = self.client.request("GET", path + "?limit=200")
-            matches = [x for x in data.get("locations", []) if x.get("merchantLocationKey") == LOCATION_KEY]
-            if len(matches) != 1:
-                raise EbayError("manual_resolution", "Inventory location creation could not be confirmed")
-        location = matches[0]
+            location = self.client.request("GET", path)
         if location.get("merchantLocationStatus") == "DISABLED":
-            self.client.request("POST", f"{path}/{quote(LOCATION_KEY, safe='')}/enable", expected=(204,))
+            self.client.request("POST", f"{path}/enable", expected=(204,))
         return LOCATION_KEY

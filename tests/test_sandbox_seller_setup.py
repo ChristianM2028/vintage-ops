@@ -33,7 +33,8 @@ def test_initial_setup_exact_contract_payloads_and_persistence(tmp_path):
     responses = [{"programs": [{"programType": "OUT_OF_STOCK_CONTROL"}]}, {}]
     for kind, identifier in (("fulfillment", "F1"), ("payment", "P1"), ("return", "R1")):
         responses += [{kind + "Policies": []}, {}, {kind + "Policies": [policy(kind, identifier)]}]
-    responses += [{"locations": []}, {}, {"locations": [{"merchantLocationKey": "vintage-ops-main", "merchantLocationStatus": "DISABLED"}]}, {}]
+    responses += [EbayError("remote", "not found", status=404), {},
+                  {"merchantLocationKey": "vintage-ops-main", "merchantLocationStatus": "DISABLED"}, {}]
     client = FakeClient(responses)
 
     saved = SandboxSellerSetup(cfg, db, client).run()
@@ -47,12 +48,14 @@ def test_initial_setup_exact_contract_payloads_and_persistence(tmp_path):
     assert creates[("POST", "/sell/account/v1/payment_policy")] == {
         "name": "Vintage Ops Sandbox Payment", "marketplaceId": "EBAY_US",
         "categoryTypes": [{"name": "ALL_EXCLUDING_MOTORS_VEHICLES", "default": True}]}
-    location = next(c for c in client.calls if c[1] == "/sell/inventory/v1/location/vintage-ops-main")
+    location = next(c for c in client.calls
+                    if c[:2] == ("POST", "/sell/inventory/v1/location/vintage-ops-main"))
     assert location == ("POST", "/sell/inventory/v1/location/vintage-ops-main", {"json": {
         "location": {"address": {"addressLine1": "2025 Hamilton Avenue", "city": "San Jose",
             "stateOrProvince": "CA", "postalCode": "95125", "country": "US"}},
         "locationTypes": ["WAREHOUSE"], "name": "Vintage Ops Sandbox Main"}, "expected": (204,)})
     assert client.calls[-1][:2] == ("POST", "/sell/inventory/v1/location/vintage-ops-main/enable")
+    assert all(path != "/sell/inventory/v1/location?limit=200" for _, path, _ in client.calls)
 
 
 def test_reuses_existing_resources_without_writes(tmp_path):
@@ -61,7 +64,7 @@ def test_reuses_existing_resources_without_writes(tmp_path):
     responses = [{"programs": [{"programType": "SELLING_POLICY_MANAGEMENT"}]}]
     responses += [{kind + "Policies": [policy(kind, identifier)]} for kind, identifier in
                   (("fulfillment", "F"), ("payment", "P"), ("return", "R"))]
-    responses += [{"locations": [{"merchantLocationKey": "vintage-ops-main", "merchantLocationStatus": "ENABLED"}]}]
+    responses += [{"merchantLocationKey": "vintage-ops-main", "merchantLocationStatus": "ENABLED"}]
     client = FakeClient(responses)
     SandboxSellerSetup(cfg, db, client).run()
     assert all(method == "GET" for method, _, _ in client.calls)
@@ -69,7 +72,8 @@ def test_reuses_existing_resources_without_writes(tmp_path):
         "/sell/account/v1/fulfillment_policy?marketplace_id=EBAY_US",
         "/sell/account/v1/payment_policy?marketplace_id=EBAY_US",
         "/sell/account/v1/return_policy?marketplace_id=EBAY_US",
-        "/sell/inventory/v1/location?limit=200"]
+        "/sell/inventory/v1/location/vintage-ops-main"]
+    assert all(path != "/sell/inventory/v1/location?limit=200" for _, path, _ in client.calls)
 
 
 def test_second_setup_reuses_resources_without_opt_in_again(tmp_path):
@@ -79,12 +83,11 @@ def test_second_setup_reuses_resources_without_opt_in_again(tmp_path):
     responses = [{"programs": []}, {}]
     for kind, identifier in resources:
         responses += [{kind + "Policies": []}, {}, {kind + "Policies": [policy(kind, identifier)]}]
-    responses += [{"locations": []}, {}, {"locations": [{
-        "merchantLocationKey": "vintage-ops-main", "merchantLocationStatus": "ENABLED"}]}]
+    responses += [EbayError("remote", "not found", status=404), {}, {
+        "merchantLocationKey": "vintage-ops-main", "merchantLocationStatus": "ENABLED"}]
     responses += [{"programs": [{"programType": "SELLING_POLICY_MANAGEMENT"}]}]
     responses += [{kind + "Policies": [policy(kind, identifier)]} for kind, identifier in resources]
-    responses += [{"locations": [{
-        "merchantLocationKey": "vintage-ops-main", "merchantLocationStatus": "ENABLED"}]}]
+    responses += [{"merchantLocationKey": "vintage-ops-main", "merchantLocationStatus": "ENABLED"}]
     client = FakeClient(responses)
     setup = SandboxSellerSetup(cfg, db, client)
 
@@ -98,6 +101,7 @@ def test_second_setup_reuses_resources_without_opt_in_again(tmp_path):
     assert len([call for call in client.calls if call[0] == "POST" and "_policy" in call[1]]) == 3
     assert len([call for call in client.calls
                 if call[:2] == ("POST", "/sell/inventory/v1/location/vintage-ops-main")]) == 1
+    assert all(path != "/sell/inventory/v1/location?limit=200" for _, path, _ in client.calls)
 
 
 def test_environment_and_marketplace_guards(tmp_path):
@@ -115,36 +119,80 @@ def location_setup(tmp_path, responses):
     return SandboxSellerSetup(cfg, db, client), client
 
 
-def test_location_http_500_create_is_confirmed_without_duplicate_create(tmp_path):
-    confirmed = {"locations": [{"merchantLocationKey": "vintage-ops-main",
-                                "merchantLocationStatus": "ENABLED"}]}
+@pytest.mark.parametrize("create_error", [
+    EbayError("remote", "HTTP 500", status=500),
+    EbayError("conflict", "already exists", status=409),
+])
+def test_uncertain_location_create_is_confirmed_without_duplicate_create(tmp_path, create_error):
+    confirmed = {"merchantLocationKey": "vintage-ops-main", "merchantLocationStatus": "ENABLED"}
     setup, client = location_setup(tmp_path, [
-        {"locations": []}, EbayError("remote", "HTTP 500", status=500), confirmed, confirmed])
+        EbayError("remote", "not found", status=404), create_error, confirmed, confirmed])
 
     assert setup._location() == "vintage-ops-main"
     assert setup._location() == "vintage-ops-main"
     assert [(method, path) for method, path, _ in client.calls] == [
-        ("GET", "/sell/inventory/v1/location?limit=200"),
+        ("GET", "/sell/inventory/v1/location/vintage-ops-main"),
         ("POST", "/sell/inventory/v1/location/vintage-ops-main"),
-        ("GET", "/sell/inventory/v1/location?limit=200"),
-        ("GET", "/sell/inventory/v1/location?limit=200")]
+        ("GET", "/sell/inventory/v1/location/vintage-ops-main"),
+        ("GET", "/sell/inventory/v1/location/vintage-ops-main")]
+    assert all(path != "/sell/inventory/v1/location?limit=200" for _, path, _ in client.calls)
 
 
 def test_enabled_location_does_not_issue_enable_request(tmp_path):
-    setup, client = location_setup(tmp_path, [{"locations": [{
-        "merchantLocationKey": "vintage-ops-main", "merchantLocationStatus": "ENABLED"}]}])
+    setup, client = location_setup(tmp_path, [{
+        "merchantLocationKey": "vintage-ops-main", "merchantLocationStatus": "ENABLED"}])
 
     setup._location()
 
-    assert client.calls == [("GET", "/sell/inventory/v1/location?limit=200", {})]
+    assert client.calls == [("GET", "/sell/inventory/v1/location/vintage-ops-main", {})]
 
 
 def test_disabled_location_is_enabled_only_after_observed_disabled(tmp_path):
-    setup, client = location_setup(tmp_path, [{"locations": [{
-        "merchantLocationKey": "vintage-ops-main", "merchantLocationStatus": "DISABLED"}]}, {}])
+    setup, client = location_setup(tmp_path, [{
+        "merchantLocationKey": "vintage-ops-main", "merchantLocationStatus": "DISABLED"}, {}])
 
     setup._location()
 
     assert [(method, path) for method, path, _ in client.calls] == [
-        ("GET", "/sell/inventory/v1/location?limit=200"),
+        ("GET", "/sell/inventory/v1/location/vintage-ops-main"),
         ("POST", "/sell/inventory/v1/location/vintage-ops-main/enable")]
+
+
+def test_location_404_is_created_and_confirmed(tmp_path):
+    confirmed = {"merchantLocationKey": "vintage-ops-main", "merchantLocationStatus": "ENABLED"}
+    setup, client = location_setup(tmp_path, [
+        EbayError("remote", "not found", status=404), {}, confirmed])
+
+    assert setup._location() == "vintage-ops-main"
+    assert [(method, path) for method, path, _ in client.calls] == [
+        ("GET", "/sell/inventory/v1/location/vintage-ops-main"),
+        ("POST", "/sell/inventory/v1/location/vintage-ops-main"),
+        ("GET", "/sell/inventory/v1/location/vintage-ops-main")]
+    assert all(path != "/sell/inventory/v1/location?limit=200" for _, path, _ in client.calls)
+
+
+def test_location_non_404_lookup_error_is_propagated_unchanged(tmp_path):
+    error = EbayError("remote", "service unavailable", status=503, request_id="request-1")
+    setup, client = location_setup(tmp_path, [error])
+
+    with pytest.raises(EbayError) as raised:
+        setup._location()
+
+    assert raised.value is error
+    assert client.calls == [("GET", "/sell/inventory/v1/location/vintage-ops-main", {})]
+    assert all(path != "/sell/inventory/v1/location?limit=200" for _, path, _ in client.calls)
+
+
+def test_unexpected_location_create_error_is_propagated_unchanged(tmp_path):
+    error = EbayError("invalid_item", "invalid address", status=400, request_id="request-2")
+    setup, client = location_setup(tmp_path, [
+        EbayError("remote", "not found", status=404), error])
+
+    with pytest.raises(EbayError) as raised:
+        setup._location()
+
+    assert raised.value is error
+    assert [(method, path) for method, path, _ in client.calls] == [
+        ("GET", "/sell/inventory/v1/location/vintage-ops-main"),
+        ("POST", "/sell/inventory/v1/location/vintage-ops-main")]
+    assert all(path != "/sell/inventory/v1/location?limit=200" for _, path, _ in client.calls)
