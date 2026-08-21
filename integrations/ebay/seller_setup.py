@@ -25,20 +25,19 @@ class SandboxSellerSetup:
         if self.cfg.marketplace_id != MARKETPLACE:
             raise EbayError("configuration", "Sandbox seller setup requires EBAY_US")
 
-        privileges = self.client.request("GET", "/sell/account/v1/privilege")
-        privilege = next((p for p in privileges.get("privileges", [])
-                          if p.get("privilegeType") == "SELLING_POLICY_MANAGEMENT"), None)
-        if not privilege or not privilege.get("enabled", False):
+        programs = self.client.request("GET", "/sell/account/v1/program/get_opted_in_programs")
+        enrolled = any(program.get("programType") == "SELLING_POLICY_MANAGEMENT"
+                       for program in programs.get("programs", []))
+        if not enrolled:
             self.client.request("POST", "/sell/account/v1/program/opt_in",
-                                json={"programType": "SELLING_POLICY_MANAGEMENT"}, expected=(204,))
+                                json={"programType": "SELLING_POLICY_MANAGEMENT"}, expected=(200,))
 
         values = {kind + "_policy_id": self._policy(kind) for kind in POLICIES}
         values["merchant_location_key"] = self._location()
         values["marketplace"] = MARKETPLACE
-        # Some test/Sandbox responses expose an identity, but the Account contract
-        # does not guarantee one. Never derive identity from the bearer credential.
-        seller_id = privileges.get("sellerId") or privileges.get("userId")
-        return self.db.save_seller_setup(seller_id=seller_id, **values)
+        # The opted-in-programs contract does not supply seller identity. Never
+        # derive identity from the bearer credential.
+        return self.db.save_seller_setup(seller_id=None, **values)
 
     def _policy(self, kind):
         name, id_field = POLICIES[kind]

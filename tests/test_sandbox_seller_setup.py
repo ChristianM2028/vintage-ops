@@ -30,7 +30,7 @@ def policy(kind, identifier):
 def test_initial_setup_exact_contract_payloads_and_persistence(tmp_path):
     cfg = Config(database_path=str(tmp_path / "setup.sqlite"), marketplace_id="EBAY_US", environment="sandbox")
     db = Database(cfg.database_path); db.migrate()
-    responses = [{"privileges": [{"privilegeType": "SELLING_POLICY_MANAGEMENT", "enabled": False}], "sellerId": "seller-1"}, {}]
+    responses = [{"programs": [{"programType": "OUT_OF_STOCK_CONTROL"}]}, {}]
     for kind, identifier in (("fulfillment", "F1"), ("payment", "P1"), ("return", "R1")):
         responses += [{kind + "Policies": []}, {}, {kind + "Policies": [policy(kind, identifier)]}]
     responses += [{"locations": []}, {}, {"locations": [{"merchantLocationKey": "vintage-ops-main", "merchantLocationStatus": "DISABLED"}]}, {}]
@@ -40,9 +40,9 @@ def test_initial_setup_exact_contract_payloads_and_persistence(tmp_path):
 
     assert (saved["seller_id"], saved["fulfillment_policy_id"], saved["payment_policy_id"],
             saved["return_policy_id"], saved["merchant_location_key"], saved["marketplace"]) == (
-                "seller-1", "F1", "P1", "R1", "vintage-ops-main", "EBAY_US")
+                None, "F1", "P1", "R1", "vintage-ops-main", "EBAY_US")
     assert client.calls[1] == ("POST", "/sell/account/v1/program/opt_in",
-                               {"json": {"programType": "SELLING_POLICY_MANAGEMENT"}, "expected": (204,)})
+                               {"json": {"programType": "SELLING_POLICY_MANAGEMENT"}, "expected": (200,)})
     creates = {(method, path): kwargs["json"] for method, path, kwargs in client.calls if "json" in kwargs and "_policy" in path}
     assert creates[("POST", "/sell/account/v1/payment_policy")] == {
         "name": "Vintage Ops Sandbox Payment", "marketplaceId": "EBAY_US",
@@ -58,18 +58,46 @@ def test_initial_setup_exact_contract_payloads_and_persistence(tmp_path):
 def test_reuses_existing_resources_without_writes(tmp_path):
     cfg = Config(database_path=str(tmp_path / "reuse.sqlite"), marketplace_id="EBAY_US", environment="sandbox")
     db = Database(cfg.database_path); db.migrate()
-    responses = [{"privileges": [{"privilegeType": "SELLING_POLICY_MANAGEMENT", "enabled": True}]}]
+    responses = [{"programs": [{"programType": "SELLING_POLICY_MANAGEMENT"}]}]
     responses += [{kind + "Policies": [policy(kind, identifier)]} for kind, identifier in
                   (("fulfillment", "F"), ("payment", "P"), ("return", "R"))]
     responses += [{"locations": [{"merchantLocationKey": "vintage-ops-main", "merchantLocationStatus": "ENABLED"}]}]
     client = FakeClient(responses)
     SandboxSellerSetup(cfg, db, client).run()
     assert all(method == "GET" for method, _, _ in client.calls)
-    assert [path for _, path, _ in client.calls] == ["/sell/account/v1/privilege",
+    assert [path for _, path, _ in client.calls] == ["/sell/account/v1/program/get_opted_in_programs",
         "/sell/account/v1/fulfillment_policy?marketplace_id=EBAY_US",
         "/sell/account/v1/payment_policy?marketplace_id=EBAY_US",
         "/sell/account/v1/return_policy?marketplace_id=EBAY_US",
         "/sell/inventory/v1/location?limit=200"]
+
+
+def test_second_setup_reuses_resources_without_opt_in_again(tmp_path):
+    cfg = Config(database_path=str(tmp_path / "twice.sqlite"), marketplace_id="EBAY_US", environment="sandbox")
+    db = Database(cfg.database_path); db.migrate()
+    resources = [("fulfillment", "F"), ("payment", "P"), ("return", "R")]
+    responses = [{"programs": []}, {}]
+    for kind, identifier in resources:
+        responses += [{kind + "Policies": []}, {}, {kind + "Policies": [policy(kind, identifier)]}]
+    responses += [{"locations": []}, {}, {"locations": [{
+        "merchantLocationKey": "vintage-ops-main", "merchantLocationStatus": "ENABLED"}]}]
+    responses += [{"programs": [{"programType": "SELLING_POLICY_MANAGEMENT"}]}]
+    responses += [{kind + "Policies": [policy(kind, identifier)]} for kind, identifier in resources]
+    responses += [{"locations": [{
+        "merchantLocationKey": "vintage-ops-main", "merchantLocationStatus": "ENABLED"}]}]
+    client = FakeClient(responses)
+    setup = SandboxSellerSetup(cfg, db, client)
+
+    setup.run()
+    setup.run()
+
+    opt_ins = [call for call in client.calls
+               if call[:2] == ("POST", "/sell/account/v1/program/opt_in")]
+    assert opt_ins == [("POST", "/sell/account/v1/program/opt_in", {
+        "json": {"programType": "SELLING_POLICY_MANAGEMENT"}, "expected": (200,)})]
+    assert len([call for call in client.calls if call[0] == "POST" and "_policy" in call[1]]) == 3
+    assert len([call for call in client.calls
+                if call[:2] == ("POST", "/sell/inventory/v1/location/vintage-ops-main")]) == 1
 
 
 def test_environment_and_marketplace_guards(tmp_path):
