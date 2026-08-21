@@ -59,6 +59,6 @@ class OAuthManager:
         r=self.http.post(self.api_base+"/identity/v1/oauth2/token",headers={"Authorization":self._auth(),"Content-Type":"application/x-www-form-urlencoded"},data={"grant_type":"refresh_token","refresh_token":refresh,"scope":row["scopes"]},timeout=self.cfg.timeout)
         if not r.ok:
             error=parse_error(r)
-            if r.status_code in (400,401): raise EbayError("reauthorization_required","Seller authorization was revoked or expired; connect the seller again",status=r.status_code,details=error.details,request_id=error.request_id)
+            if r.status_code in (400,401): raise EbayError("reauthorization_required","Seller authorization was revoked or expired; connect the seller again",status=r.status_code,details=error.details,request_id=error.request_id,rlogid=error.rlogid)
             raise error
         self._save(r.json(),refresh); return r.json()["access_token"]

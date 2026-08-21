@@ -72,7 +72,7 @@ class EbayService:
             return self.db.update_item(item["id"],ebay_sync_state="synchronized",synced_revision=item.get("local_revision",0),last_error=None)
         except EbayError as e:
             self.db.update_item(item["id"],ebay_sync_state="failed",last_error=json.dumps(e.safe_dict()))
-            if e.kind=="conflict": raise EbayError("relist_required","eBay does not permit this change while published; withdraw and relist",status=e.status,details=e.details,request_id=e.request_id)
+            if e.kind=="conflict": raise EbayError("relist_required","eBay does not permit this change while published; withdraw and relist",status=e.status,details=e.details,request_id=e.request_id,rlogid=e.rlogid)
             raise
     def delistItem(self,item):
         if item.get("ebay_publication_state")=="withdrawn": return item
