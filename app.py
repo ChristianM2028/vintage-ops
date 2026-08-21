@@ -246,4 +246,5 @@ def create_app(config=None, http=None):
     app.extensions.update(vintage_db=db,ebay_components=real_components,marketplace_adapters=adapters)
     return app
 
-if __name__=="__main__": create_app().run(debug=True)
+if __name__ == "__main__":
+    create_app().run(debug=True, ssl_context="adhoc")
