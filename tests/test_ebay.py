@@ -76,7 +76,7 @@ def test_structured_error():
     error=parse_error(Response(409,{"errors":[{"errorId":25001,"domain":"API_INVENTORY","category":"REQUEST","message":"Conflict","parameters":[{"name":"offerId","value":"x"}]}]},{"X-EBAY-C-REQUEST-ID":"req","RLoGiD":"rlog-1"}))
     assert error.kind=="conflict" and error.details[0]["errorId"]==25001 and error.request_id=="req" and error.rlogid=="rlog-1"
     assert error.safe_dict()=={"kind":"conflict","message":"Conflict","status":409,
-        "request_id":"req","rlogid":"rlog-1","details":error.details}
+        "request_id":"req","rlogid":"rlog-1","method":None,"path":None,"details":error.details}
 
 def test_response_logging_is_structured_correlated_and_secret_free(env,caplog):
     cfg,_=env
@@ -91,12 +91,17 @@ def test_response_logging_is_structured_correlated_and_secret_free(env,caplog):
     client=EbayClient(cfg,OAuth(token),http)
 
     with caplog.at_level(logging.INFO,logger="integrations.ebay.client"):
-        with pytest.raises(EbayError):
+        with pytest.raises(EbayError) as exc:
             client.request(
                 "post",
                 "/sell/inventory/v1/location/vintage-ops-main?limit=20&offset=5",
                 json={"credential":payload_credential},
             )
+
+    assert exc.value.method=="POST"
+    assert exc.value.path=="/sell/inventory/v1/location/vintage-ops-main"
+    assert exc.value.safe_dict()["method"]=="POST"
+    assert exc.value.safe_dict()["path"]=="/sell/inventory/v1/location/vintage-ops-main"
 
     assert len(caplog.records)==1
     assert caplog.records[0].levelno==logging.INFO

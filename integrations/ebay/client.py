@@ -29,7 +29,11 @@ class EbayClient:
             if value is not None: fields[field]=value
         # Keep the event deliberately limited to operational correlation data.
         logger.info("eBay response",extra={"ebay_response":fields})
-        if r.status_code not in expected: raise parse_error(r)
+        if r.status_code not in expected:
+            error=parse_error(r)
+            error.method=normalized_method
+            error.path=parsed.path
+            raise error
         if not r.content: return {}
         try: return r.json()
         except ValueError: return {}

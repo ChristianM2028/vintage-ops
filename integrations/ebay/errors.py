@@ -1,8 +1,8 @@
 class EbayError(Exception):
-    def __init__(self, kind, message, *, status=None, details=None, request_id=None, rlogid=None):
-        super().__init__(message); self.kind=kind; self.status=status; self.details=details or []; self.request_id=request_id; self.rlogid=rlogid
+    def __init__(self, kind, message, *, status=None, details=None, request_id=None, rlogid=None, method=None, path=None):
+        super().__init__(message); self.kind=kind; self.status=status; self.details=details or []; self.request_id=request_id; self.rlogid=rlogid; self.method=method; self.path=path
     def safe_dict(self):
-        return {"kind":self.kind,"message":str(self),"status":self.status,"request_id":self.request_id,"rlogid":self.rlogid,"details":self.details}
+        return {"kind":self.kind,"message":str(self),"status":self.status,"request_id":self.request_id,"rlogid":self.rlogid,"method":self.method,"path":self.path,"details":self.details}
 
 def _header(headers, name):
     """Read a response header without relying on a case-aware mapping."""
