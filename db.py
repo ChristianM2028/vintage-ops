@@ -23,6 +23,23 @@ class Database:
                 if con.execute("SELECT 1 FROM schema_migrations WHERE version=?",(name,)).fetchone(): continue
                 con.executescript(open(os.path.join(root,name), encoding="utf8").read())
                 con.execute("INSERT INTO schema_migrations VALUES (?,?)",(name,now()))
+    def get_seller_setup(self):
+        with self.connect() as con:
+            row=con.execute("SELECT * FROM ebay_seller_setup WHERE id=1").fetchone()
+            return dict(row) if row else None
+    def save_seller_setup(self, seller_id, fulfillment_policy_id, payment_policy_id,
+                          return_policy_id, merchant_location_key, marketplace):
+        stamp=now()
+        with self.transaction(immediate=True) as con:
+            con.execute("""INSERT INTO ebay_seller_setup
+                (id,seller_id,fulfillment_policy_id,payment_policy_id,return_policy_id,merchant_location_key,marketplace,updated_at)
+                VALUES (1,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+                seller_id=excluded.seller_id, fulfillment_policy_id=excluded.fulfillment_policy_id,
+                payment_policy_id=excluded.payment_policy_id, return_policy_id=excluded.return_policy_id,
+                merchant_location_key=excluded.merchant_location_key, marketplace=excluded.marketplace,
+                updated_at=excluded.updated_at""", (seller_id,fulfillment_policy_id,payment_policy_id,
+                    return_policy_id,merchant_location_key,marketplace,stamp))
+        return self.get_seller_setup()
     @contextmanager
     def transaction(self, immediate=False):
         con=self.connect()
