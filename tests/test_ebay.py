@@ -1,4 +1,5 @@
 import json
+import logging
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import pytest
@@ -6,6 +7,7 @@ from cryptography.fernet import Fernet
 from config import Config
 from db import Database
 from integrations.ebay.errors import EbayError, parse_error
+from integrations.ebay.client import EbayClient
 from integrations.ebay.oauth import OAuthManager
 from integrations.ebay.service import EbayService
 
@@ -17,6 +19,12 @@ class Response:
 class HTTP:
     def __init__(self,responses): self.responses=list(responses); self.calls=[]
     def post(self,*a,**kw): self.calls.append((a,kw)); return self.responses.pop(0)
+class RequestHTTP:
+    def __init__(self,responses): self.responses=list(responses); self.calls=[]
+    def request(self,*a,**kw): self.calls.append((a,kw)); return self.responses.pop(0)
+class OAuth:
+    def __init__(self,token): self.token=token
+    def access_token(self): return self.token
 class FakeClient:
     def __init__(self,responses): self.responses=list(responses); self.calls=[]
     def request(self,*args,**kwargs):
@@ -65,8 +73,33 @@ def test_prerequisite_and_photo_validation(env,item):
     with pytest.raises(EbayError) as exc: EbayService(cfg,db,FakeClient([])).listItem(bad)
     assert exc.value.kind=="invalid_item"
 def test_structured_error():
-    error=parse_error(Response(409,{"errors":[{"errorId":25001,"domain":"API_INVENTORY","category":"REQUEST","message":"Conflict","parameters":[{"name":"offerId","value":"x"}]}]},{"x-ebay-c-request-id":"req"}))
-    assert error.kind=="conflict" and error.details[0]["errorId"]==25001 and error.request_id=="req"
+    error=parse_error(Response(409,{"errors":[{"errorId":25001,"domain":"API_INVENTORY","category":"REQUEST","message":"Conflict","parameters":[{"name":"offerId","value":"x"}]}]},{"X-EBAY-C-REQUEST-ID":"req","RLoGiD":"rlog-1"}))
+    assert error.kind=="conflict" and error.details[0]["errorId"]==25001 and error.request_id=="req" and error.rlogid=="rlog-1"
+    assert error.safe_dict()=={"kind":"conflict","message":"Conflict","status":409,
+        "request_id":"req","rlogid":"rlog-1","details":error.details}
+
+def test_response_logging_is_structured_correlated_and_secret_free(env,caplog):
+    cfg,_=env
+    token="SENTINEL-BEARER-CREDENTIAL"
+    secret="SENTINEL-CLIENT-SECRET"
+    cfg=replace(cfg,client_secret=secret)
+    response=Response(500,{"errors":[{"errorId":25002,"message":"Remote failure"}]},{
+        "RLOGID":"rlog-500","X-eBay-C-Request-Id":"request-500",
+        "X-EBAY-CORRELATION-ID":"correlation-500"})
+    http=RequestHTTP([response])
+    client=EbayClient(cfg,OAuth(token),http)
+
+    with caplog.at_level(logging.DEBUG,logger="integrations.ebay.client"):
+        with pytest.raises(EbayError):
+            client.request("post","/sell/inventory/v1/location/vintage-ops-main",json={"credential":secret})
+
+    assert len(caplog.records)==1
+    assert caplog.records[0].ebay_response=={
+        "method":"POST","path":"/sell/inventory/v1/location/vintage-ops-main","status":500,
+        "error_id":25002,"rlogid":"rlog-500","x-ebay-c-request-id":"request-500",
+        "x-ebay-correlation-id":"correlation-500"}
+    rendered=caplog.text+repr(caplog.records[0].ebay_response)
+    assert token not in rendered and secret not in rendered
 def test_withdraw_idempotent_and_failure(env,item):
     cfg,db=env; withdrawn=dict(item,ebay_offer_id="O",ebay_publication_state="withdrawn"); assert not EbayService(cfg,db,FakeClient([])).delistItem(withdrawn) is None
     with pytest.raises(EbayError) as exc: EbayService(cfg,db,FakeClient([EbayError("remote","no")])).delistItem(dict(item,ebay_offer_id="O"))

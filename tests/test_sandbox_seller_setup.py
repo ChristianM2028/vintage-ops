@@ -106,3 +106,45 @@ def test_environment_and_marketplace_guards(tmp_path):
         SandboxSellerSetup(Config(environment="production"), db, FakeClient([])).run()
     with pytest.raises(EbayError):
         SandboxSellerSetup(Config(environment="sandbox", marketplace_id="EBAY_GB"), db, FakeClient([])).run()
+
+
+def location_setup(tmp_path, responses):
+    cfg = Config(database_path=str(tmp_path / "location.sqlite"), marketplace_id="EBAY_US", environment="sandbox")
+    db = Database(cfg.database_path); db.migrate()
+    client = FakeClient(responses)
+    return SandboxSellerSetup(cfg, db, client), client
+
+
+def test_location_http_500_create_is_confirmed_without_duplicate_create(tmp_path):
+    confirmed = {"locations": [{"merchantLocationKey": "vintage-ops-main",
+                                "merchantLocationStatus": "ENABLED"}]}
+    setup, client = location_setup(tmp_path, [
+        {"locations": []}, EbayError("remote", "HTTP 500", status=500), confirmed, confirmed])
+
+    assert setup._location() == "vintage-ops-main"
+    assert setup._location() == "vintage-ops-main"
+    assert [(method, path) for method, path, _ in client.calls] == [
+        ("GET", "/sell/inventory/v1/location?limit=200"),
+        ("POST", "/sell/inventory/v1/location/vintage-ops-main"),
+        ("GET", "/sell/inventory/v1/location?limit=200"),
+        ("GET", "/sell/inventory/v1/location?limit=200")]
+
+
+def test_enabled_location_does_not_issue_enable_request(tmp_path):
+    setup, client = location_setup(tmp_path, [{"locations": [{
+        "merchantLocationKey": "vintage-ops-main", "merchantLocationStatus": "ENABLED"}]}])
+
+    setup._location()
+
+    assert client.calls == [("GET", "/sell/inventory/v1/location?limit=200", {})]
+
+
+def test_disabled_location_is_enabled_only_after_observed_disabled(tmp_path):
+    setup, client = location_setup(tmp_path, [{"locations": [{
+        "merchantLocationKey": "vintage-ops-main", "merchantLocationStatus": "DISABLED"}]}, {}])
+
+    setup._location()
+
+    assert [(method, path) for method, path, _ in client.calls] == [
+        ("GET", "/sell/inventory/v1/location?limit=200"),
+        ("POST", "/sell/inventory/v1/location/vintage-ops-main/enable")]
