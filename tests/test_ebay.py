@@ -82,6 +82,7 @@ def test_response_logging_is_structured_correlated_and_secret_free(env,caplog):
     cfg,_=env
     token="SENTINEL-BEARER-CREDENTIAL"
     secret="SENTINEL-CLIENT-SECRET"
+    payload_credential="SENTINEL-PAYLOAD-CREDENTIAL"
     cfg=replace(cfg,client_secret=secret)
     response=Response(500,{"errors":[{"errorId":25002,"message":"Remote failure"}]},{
         "RLOGID":"rlog-500","X-eBay-C-Request-Id":"request-500",
@@ -89,17 +90,23 @@ def test_response_logging_is_structured_correlated_and_secret_free(env,caplog):
     http=RequestHTTP([response])
     client=EbayClient(cfg,OAuth(token),http)
 
-    with caplog.at_level(logging.DEBUG,logger="integrations.ebay.client"):
+    with caplog.at_level(logging.INFO,logger="integrations.ebay.client"):
         with pytest.raises(EbayError):
-            client.request("post","/sell/inventory/v1/location/vintage-ops-main",json={"credential":secret})
+            client.request(
+                "post",
+                "/sell/inventory/v1/location/vintage-ops-main?limit=20&offset=5",
+                json={"credential":payload_credential},
+            )
 
     assert len(caplog.records)==1
+    assert caplog.records[0].levelno==logging.INFO
     assert caplog.records[0].ebay_response=={
-        "method":"POST","path":"/sell/inventory/v1/location/vintage-ops-main","status":500,
+        "method":"POST","path":"/sell/inventory/v1/location/vintage-ops-main?limit=20&offset=5","status":500,
         "error_id":25002,"rlogid":"rlog-500","x-ebay-c-request-id":"request-500",
         "x-ebay-correlation-id":"correlation-500"}
     rendered=caplog.text+repr(caplog.records[0].ebay_response)
-    assert token not in rendered and secret not in rendered
+    assert "https://api.sandbox.ebay.com" not in rendered
+    assert token not in rendered and secret not in rendered and payload_credential not in rendered
 def test_withdraw_idempotent_and_failure(env,item):
     cfg,db=env; withdrawn=dict(item,ebay_offer_id="O",ebay_publication_state="withdrawn"); assert not EbayService(cfg,db,FakeClient([])).delistItem(withdrawn) is None
     with pytest.raises(EbayError) as exc: EbayService(cfg,db,FakeClient([EbayError("remote","no")])).delistItem(dict(item,ebay_offer_id="O"))
