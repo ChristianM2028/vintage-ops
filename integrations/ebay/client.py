@@ -28,7 +28,7 @@ class EbayClient:
             value=_header(r.headers,header)
             if value is not None: fields[field]=value
         # Keep the event deliberately limited to operational correlation data.
-        logger.debug("eBay response",extra={"ebay_response":fields})
+        logger.info("eBay response",extra={"ebay_response":fields})
         if r.status_code not in expected: raise parse_error(r)
         if not r.content: return {}
         try: return r.json()
