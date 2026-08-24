@@ -122,8 +122,25 @@ class Database:
             con.execute("UPDATE items SET status=?,updated_at=? WHERE id=?",(status,now(),item_id)); return self.get_item(item_id,con)
         return self.update_item(item_id,status=status)
     def update_marketplace(self,item_id,**values): return self.update_item(item_id,**values)
-    def update_photo_publication(self,photo_id,url,fingerprint,error):
-        with self.transaction() as c: c.execute("UPDATE item_photos SET remote_url=?,source_fingerprint=?,publication_error=?,updated_at=? WHERE id=?",(url,fingerprint,error,now(),photo_id))
+    def update_photo_eps(self, photo_id, image_id, url, fingerprint, error=None):
+        """Persist one successful EPS upload independently of its siblings."""
+        with self.transaction(immediate=True) as c:
+            c.execute("""UPDATE item_photos SET ebay_image_id=?,ebay_eps_url=?,
+                ebay_source_fingerprint=?,ebay_upload_error=?,updated_at=? WHERE id=?""",
+                (image_id,url,fingerprint,error,now(),photo_id))
+    def set_photo_eps_error(self, photo_id, error):
+        # Do not erase a prior successful identity: a changed local file may be
+        # retried while its older EPS object remains part of the promoted set.
+        with self.transaction() as c:
+            c.execute("UPDATE item_photos SET ebay_upload_error=?,updated_at=? WHERE id=?",(error,now(),photo_id))
+    def promote_eps_photo_set(self, item_id, urls):
+        """Atomically expose a complete ordered candidate as last-known-good."""
+        with self.transaction(immediate=True) as c:
+            row=c.execute("SELECT photo_set_revision FROM items WHERE id=?",(item_id,)).fetchone()
+            if not row: raise ValueError("Item not found")
+            c.execute("UPDATE items SET photo_urls=?,ebay_synced_photo_revision=?,updated_at=? WHERE id=?",
+                      (json.dumps(urls),row["photo_set_revision"],now(),item_id))
+            c.execute("UPDATE item_photos SET ebay_upload_error=NULL WHERE item_id=?",(item_id,))
     def update_item_and_photos(self,item_id,values,photos=None):
         """Atomically accept canonical edits and optional replacement photo rows."""
         allowed={"title","description","price","quantity","condition","category","category_name","brand","size","color","item_specifics"}
@@ -135,6 +152,36 @@ class Database:
                 c.execute("DELETE FROM item_photos WHERE item_id=?",(item_id,))
                 for order,p in enumerate(photos): c.execute("INSERT INTO item_photos(item_id,filename,original_filename,display_order,created_at,updated_at) VALUES(?,?,?,?,?,?)",(item_id,p["filename"],p["original_filename"],order,stamp,stamp))
             return self.get_item(item_id,c)
+    def mutate_item_photos(self,item_id,values,ordered_photos):
+        """Apply validated retains/replacements/additions without losing EPS state.
+
+        Existing entries are ``{'id': ...}``; new entries carry filename and
+        original_filename.  Returns the hydrated item and filenames made
+        unreferenced by the committed mutation.
+        """
+        allowed={"title","description","price","quantity","condition","category","category_name","brand","size","color","item_specifics"}
+        if set(values)-allowed: raise ValueError("Unsupported editable item field")
+        stamp=now(); values=dict(values); values["item_specifics"]=json.dumps(values.get("item_specifics",{}))
+        with self.transaction(immediate=True) as c:
+            current={r["id"]:dict(r) for r in c.execute("SELECT * FROM item_photos WHERE item_id=?",(item_id,))}
+            retained=[p["id"] for p in ordered_photos if "id" in p]
+            if len(retained)!=len(set(retained)) or any(pid not in current for pid in retained): raise ValueError("Invalid photo selection")
+            removed=[row["filename"] for pid,row in current.items() if pid not in retained]
+            # Avoid transient UNIQUE(item_id, display_order) collisions.
+            c.execute("UPDATE item_photos SET display_order=display_order+1000000 WHERE item_id=?",(item_id,))
+            for order,p in enumerate(ordered_photos):
+                if "id" in p:
+                    c.execute("UPDATE item_photos SET display_order=?,updated_at=? WHERE id=? AND item_id=?",(order,stamp,p["id"],item_id))
+                else:
+                    c.execute("INSERT INTO item_photos(item_id,filename,original_filename,display_order,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                              (item_id,p["filename"],p["original_filename"],order,stamp,stamp))
+            if current:
+                placeholders=",".join("?" for _ in retained)
+                if retained: c.execute(f"DELETE FROM item_photos WHERE item_id=? AND id NOT IN ({placeholders})",[item_id,*retained])
+                else: c.execute("DELETE FROM item_photos WHERE item_id=?",(item_id,))
+            c.execute("UPDATE items SET "+",".join(f"{k}=?" for k in values)+",local_revision=local_revision+1,photo_set_revision=photo_set_revision+1,ebay_sync_state='pending',updated_at=? WHERE id=?",
+                      [*values.values(),stamp,item_id])
+            return self.get_item(item_id,c),removed
     def acquire_publication_lock(self,item_id,seconds=120):
         from datetime import timedelta
         token=secrets.token_urlsafe(24); expiry=(datetime.now(timezone.utc)+timedelta(seconds=seconds)).isoformat()

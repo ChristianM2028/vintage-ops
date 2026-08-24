@@ -83,7 +83,7 @@ Production requires a separate production keyset and an authorized production se
 
 Set `EBAY_MARKETPLACE_ID` and `EBAY_CURRENCY`, an enabled `EBAY_MERCHANT_LOCATION_KEY`, and fulfillment, payment, and return policy IDs owned by the same seller and marketplace. The seller must have production selling privileges, be enrolled in Business Policies, and authorize the base, Inventory, Account, and Fulfillment scopes. Existing grants made before Fulfillment was added must be reauthorized.
 
-Local Flask URLs are never used as production image URLs. Configure an HTTPS content-addressable upload service with `MEDIA_UPLOAD_URL` and its public retrieval origin with `MEDIA_PUBLIC_BASE_URL`; set `MEDIA_UPLOAD_TOKEN` when the service requires a bearer credential. The origin must make each uploaded image durably and anonymously retrievable over HTTPS in a format accepted by eBay.
+Local storefront files remain canonical. For real eBay listings the application uploads them directly to eBay Picture Services with the item's persisted Sandbox or Production OAuth configuration; EPS identities and URLs are tracked separately from local filenames.
 
 Vintage Ops uses scheduled Fulfillment API reconciliation rather than browser automation. Invoke the seller reconciliation action periodically and ensure the production account has the Fulfillment grant. If notifications are added, separately configure the eBay notification destination/account challenge-response requirements; notifications do not remove the need for idempotent order-line processing.
 
