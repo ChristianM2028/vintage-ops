@@ -29,6 +29,10 @@ def create_app(config=None, http=None, stripe_adapter=None):
     logging.getLogger("werkzeug").addFilter(RedactOAuthQuery())
     db=Database(cfg.database_path); db.migrate(); http_session=http or requests.Session()
     stripe_gateway=stripe_adapter or (FakeStripeAdapter(cfg) if cfg.stripe_fake_mode else StripeAdapter(cfg))
+    password_hash_valid=True
+    if cfg.seller_password_hash:
+        try: check_password_hash(cfg.seller_password_hash,"startup-validation-only")
+        except (ValueError,TypeError): password_hash_valid=False
     app.config.update(SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE="Lax",SESSION_COOKIE_SECURE=cfg.session_cookie_secure)
     def real_components(overrides=None):
         current=replace(cfg,**(overrides or {})); oauth=OAuthManager(current,db,http_session)
@@ -86,7 +90,9 @@ def create_app(config=None, http=None, stripe_adapter=None):
     def login():
         if request.method=="POST":
             valid_user=secrets.compare_digest(request.form.get("username",""),cfg.seller_username)
-            valid_password=check_password_hash(cfg.seller_password_hash,request.form.get("password","")) if cfg.seller_password_hash else False
+            try:
+                valid_password=password_hash_valid and check_password_hash(cfg.seller_password_hash,request.form.get("password","")) if cfg.seller_password_hash else False
+            except (ValueError,TypeError): valid_password=False
             if valid_user and valid_password:
                 destination=request.form.get("next","")
                 session.clear(); session["seller_authenticated"]=True; session["csrf_token"]=secrets.token_urlsafe(32)
@@ -234,7 +240,10 @@ def create_app(config=None, http=None, stripe_adapter=None):
         try: event=stripe_gateway.verify_webhook(payload,request.headers.get("Stripe-Signature"))
         except StripeIntegrationError: abort(400,"Invalid signature")
         event_id=str(event.get("id", "")); event_type=str(event.get("type", ""))
-        if not event_id or not db.claim_webhook(event_id,event_type): return "",200
+        claim=db.claim_webhook(event_id,event_type) if event_id else None
+        if not event_id: return "",400
+        if claim in ("already_complete","busy"): return "",200
+        if claim != "claimed": return "",503
         try:
             obj=(event.get("data") or {}).get("object") or {}
             sid=obj.get("id") if event_type.startswith("checkout.session") else obj.get("checkout_session")
@@ -243,16 +252,20 @@ def create_app(config=None, http=None, stripe_adapter=None):
             pi_id=pi.get("id") if isinstance(pi,dict) else pi
             order=db.find_order_by_stripe(sid,pi_id) or (db.get_order(reference) if reference else None)
             if order and sid: order=db.attach_checkout(order["public_id"],sid,pi_id,source="stripe_webhook")
+            if order and pi_id: order=db.attach_payment_intent(order["public_id"],pi_id,order_service._fulfillment(obj))
             if order and event_type in ("checkout.session.completed","payment_intent.amount_capturable_updated"):
                 session_obj=obj if event_type.startswith("checkout.session") else None
                 intent=obj if event_type.startswith("payment_intent") else (pi if isinstance(pi,dict) else None)
-                order_service.process_authorization(order,session_obj,intent)
+                outcome=order_service.process_authorization(order,session_obj,intent)
+                if outcome["state"]=="manual_resolution": raise RuntimeError("manual_resolution")
             elif order and event_type in ("checkout.session.expired","payment_intent.canceled") and order["state"] in ("checkout_pending","authorization_pending"):
                 db.release_order(order["public_id"],"expired" if event_type=="checkout.session.expired" else "cancelled",event_type,source="stripe_webhook")
             db.finish_webhook(event_id); return "",200
         except Exception as exc:
-            app.logger.warning("Stripe event processing failed: %s",type(exc).__name__)
-            db.finish_webhook(event_id,"Processing failed"); return "",500
+            classification="manual_resolution" if type(exc).__name__=="RuntimeError" else "processing_failure"
+            known=order["public_id"] if "order" in locals() and order else None
+            app.logger.warning("Stripe webhook failure event_id=%s event_type=%s order=%s classification=%s",event_id,event_type,known,classification)
+            db.finish_webhook(event_id,classification); return "",503
 
     def fake_development_mode(): return cfg.stripe_fake_mode and cfg.environment != "production"
     def render_order(public_id, **context):

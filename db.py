@@ -9,6 +9,10 @@ TRANSITIONS = {
 }
 def now(): return datetime.now(timezone.utc).isoformat()
 
+class Disposition(str):
+    """Explicit claim result, while retaining compatibility with old bool callers."""
+    def __bool__(self): return self == "claimed"
+
 class Database:
     def __init__(self, path): self.path = path
     def connect(self):
@@ -212,7 +216,7 @@ class Database:
         "paid":{"sold","manual_resolution"}, "authorization_cancel_pending":{"cancelled","unavailable","manual_resolution"},
         "sold":{"manual_resolution"}, "cancelled":set(), "expired":set(), "unavailable":{"manual_resolution"}, "manual_resolution":set()
     }
-    def create_storefront_order(self, sku, duration_seconds=1800):
+    def create_storefront_order(self, sku, duration_seconds=1800, provider_identity="legacy_unknown"):
         stamp=now(); expiry=(datetime.now(timezone.utc)+timedelta(seconds=duration_seconds)).isoformat()
         with self.transaction(immediate=True) as c:
             item=c.execute("SELECT * FROM items WHERE sku=?",(sku,)).fetchone()
@@ -221,7 +225,7 @@ class Database:
             if reservation: raise ValueError("Item reserved")
             c.execute("UPDATE item_reservations SET state='expired',close_reason='expired',updated_at=? WHERE item_id=? AND state='open' AND expires_at<=?",(stamp,item["id"],stamp))
             public_id=secrets.token_urlsafe(24)
-            cur=c.execute("INSERT INTO storefront_orders(public_id,item_id,price_snapshot,currency_snapshot,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",(public_id,item["id"],item["price"],item["currency"],"checkout_pending",stamp,stamp))
+            cur=c.execute("INSERT INTO storefront_orders(public_id,item_id,price_snapshot,currency_snapshot,state,stripe_provider_identity,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",(public_id,item["id"],item["price"],item["currency"],"checkout_pending",provider_identity,stamp,stamp))
             rid=c.execute("INSERT INTO item_reservations(item_id,order_id,state,expires_at,created_at,updated_at) VALUES(?,?,'open',?,?,?)",(item["id"],cur.lastrowid,expiry,stamp,stamp)).lastrowid
             c.execute("UPDATE storefront_orders SET reservation_id=? WHERE id=?",(rid,cur.lastrowid))
             self._event(c,cur.lastrowid,None,"checkout_pending","shopper","order_created")
@@ -239,7 +243,13 @@ class Database:
             c.execute("INSERT INTO storefront_order_events(order_id,from_state,to_state,source,category,created_at) VALUES(?,?,?,?,?,?)",(order_id,old,new,source,category,now()))
     def attach_checkout(self, public_id, session_id, payment_intent_id=None, source="shopper"):
         with self.transaction(immediate=True) as c:
-            before=c.execute("SELECT id,state FROM storefront_orders WHERE public_id=?",(public_id,)).fetchone()
+            before=c.execute("SELECT * FROM storefront_orders WHERE public_id=?",(public_id,)).fetchone()
+            if not before: raise ValueError("Order not found")
+            if ((before["stripe_checkout_session_id"] and session_id and before["stripe_checkout_session_id"]!=session_id) or
+                (before["stripe_payment_intent_id"] and payment_intent_id and before["stripe_payment_intent_id"]!=payment_intent_id)):
+                c.execute("UPDATE storefront_orders SET state='manual_resolution',conflict_details='Conflicting Stripe identifiers',updated_at=? WHERE id=?",(now(),before["id"]))
+                self._event(c,before["id"],before["state"],"manual_resolution",source,"provider_identifier_conflict")
+                return self.get_order(public_id,c)
             c.execute("UPDATE storefront_orders SET stripe_checkout_session_id=COALESCE(stripe_checkout_session_id,?),stripe_payment_intent_id=COALESCE(stripe_payment_intent_id,?),state=CASE WHEN state='checkout_pending' THEN 'authorization_pending' ELSE state END,updated_at=? WHERE public_id=?",(session_id,payment_intent_id,now(),public_id))
             after=self.get_order(public_id,c); self._event(c,before["id"],before["state"],after["state"],source,"checkout_attached")
             return after
@@ -249,7 +259,9 @@ class Database:
             row=c.execute("SELECT id,stripe_payment_intent_id,state FROM storefront_orders WHERE public_id=?",(public_id,)).fetchone()
             if not row: raise ValueError("Order not found")
             if row["stripe_payment_intent_id"] and row["stripe_payment_intent_id"]!=payment_intent_id: raise ValueError("Conflicting PaymentIntent")
-            values={"stripe_payment_intent_id":payment_intent_id,**fulfillment,"updated_at":now()}
+            # Webhook delivery order is unspecified. Fill blanks, but never erase
+            # already-known customer/fulfilment data with absent values.
+            values={"stripe_payment_intent_id":payment_intent_id,**{k:v for k,v in fulfillment.items() if v is not None},"updated_at":now()}
             c.execute("UPDATE storefront_orders SET "+",".join(f"{k}=?" for k in values)+" WHERE id=?",[*values.values(),row["id"]])
             self._event(c,row["id"],row["state"],row["state"],"stripe_webhook","payment_intent_attached")
             return self.get_order(public_id,c)
@@ -279,16 +291,54 @@ class Database:
                 order=c.execute("SELECT state FROM storefront_orders WHERE id=?",(row["order_id"],)).fetchone()
                 self._event(c,row["order_id"],"authorization_pending",order["state"],"maintenance","reservation_expired")
             return len(rows)
-    def claim_webhook(self,event_id,event_type):
+    def claim_webhook(self,event_id,event_type,lease_seconds=120):
+        token=secrets.token_urlsafe(24); stamp=now(); expiry=(datetime.now(timezone.utc)+timedelta(seconds=lease_seconds)).isoformat()
         with self.transaction(immediate=True) as c:
-            try: c.execute("INSERT INTO stripe_webhook_events(event_id,event_type,state,created_at,updated_at) VALUES(?,?,'processing',?,?)",(event_id,event_type,now(),now())); return True
+            try:
+                c.execute("INSERT INTO stripe_webhook_events(event_id,event_type,state,claim_token,lease_expires_at,created_at,updated_at) VALUES(?,?,'processing',?,?,?,?)",(event_id,event_type,token,expiry,stamp,stamp))
+                return Disposition("claimed")
             except sqlite3.IntegrityError:
-                row=c.execute("SELECT state FROM stripe_webhook_events WHERE event_id=?",(event_id,)).fetchone()
-                if row and row["state"]=="failed":
-                    c.execute("UPDATE stripe_webhook_events SET state='processing',attempts=attempts+1,error=NULL,updated_at=? WHERE event_id=?",(now(),event_id)); return True
-                return False
-    def finish_webhook(self,event_id,error=None):
-        with self.transaction() as c: c.execute("UPDATE stripe_webhook_events SET state=?,error=?,updated_at=? WHERE event_id=?",("failed" if error else "processed",error,now(),event_id))
+                row=c.execute("SELECT * FROM stripe_webhook_events WHERE event_id=?",(event_id,)).fetchone()
+                if row["state"]=="processed": return Disposition("already_complete")
+                if row["state"]=="processing" and row["lease_expires_at"] and row["lease_expires_at"]>stamp: return Disposition("busy")
+                c.execute("UPDATE stripe_webhook_events SET state='processing',attempts=attempts+1,claim_token=?,lease_expires_at=?,updated_at=? WHERE event_id=?",(token,expiry,stamp,event_id))
+                return Disposition("claimed")
+    def finish_webhook(self,event_id,error=None,claim_token=None):
+        with self.transaction(immediate=True) as c:
+            where="event_id=?"; args=[event_id]
+            if claim_token: where+=" AND claim_token=?"; args.append(claim_token)
+            c.execute(f"UPDATE stripe_webhook_events SET state=?,error=?,claim_token=NULL,lease_expires_at=NULL,updated_at=? WHERE {where}",( "failed" if error else "processed",error,now(),*args))
+
+    def claim_operation(self, public_id, operation_type, lease_seconds=120):
+        """Atomically recover/create and claim one durable per-order operation."""
+        token=secrets.token_urlsafe(24); stamp=now(); expiry=(datetime.now(timezone.utc)+timedelta(seconds=lease_seconds)).isoformat()
+        with self.transaction(immediate=True) as c:
+            order=c.execute("SELECT * FROM storefront_orders WHERE public_id=?",(public_id,)).fetchone()
+            if not order: return {"disposition":"superseded","token":None,"order":None}
+            if order["state"]=="manual_resolution": return {"disposition":"manual_resolution","token":None,"order":dict(order)}
+            row=c.execute("SELECT * FROM storefront_operations WHERE order_id=? AND operation_type=?",(order["id"],operation_type)).fetchone()
+            if row and row["state"]=="complete": return {"disposition":"already_complete","token":None,"order":dict(order),"operation":dict(row)}
+            if row and row["state"]=="manual_resolution": return {"disposition":"manual_resolution","token":None,"order":dict(order),"operation":dict(row)}
+            if row and row["state"]=="running" and row["lease_expires_at"] and row["lease_expires_at"]>stamp:
+                return {"disposition":"busy","token":None,"order":dict(order),"operation":dict(row)}
+            key={"ebay_withdrawal":"withdraw","stripe_capture":"capture","stripe_cancel":"cancel"}[operation_type]+":"+public_id
+            if row:
+                c.execute("UPDATE storefront_operations SET state='running',attempts=attempts+1,claim_token=?,lease_expires_at=?,error=NULL,updated_at=? WHERE id=?",(token,expiry,stamp,row["id"]))
+            else:
+                c.execute("INSERT INTO storefront_operations(order_id,operation_type,state,attempts,idempotency_key,claim_token,lease_expires_at,created_at,updated_at) VALUES(?,?,'running',1,?,?,?,?,?)",(order["id"],operation_type,key,token,expiry,stamp,stamp))
+            op=c.execute("SELECT * FROM storefront_operations WHERE order_id=? AND operation_type=?",(order["id"],operation_type)).fetchone()
+            return {"disposition":"claimed","token":token,"order":dict(order),"operation":dict(op)}
+
+    def renew_operation(self, public_id, operation_type, token, lease_seconds=120):
+        expiry=(datetime.now(timezone.utc)+timedelta(seconds=lease_seconds)).isoformat()
+        with self.transaction(immediate=True) as c:
+            changed=c.execute("UPDATE storefront_operations SET lease_expires_at=?,updated_at=? WHERE order_id=(SELECT id FROM storefront_orders WHERE public_id=?) AND operation_type=? AND state='running' AND claim_token=?",(expiry,now(),public_id,operation_type,token)).rowcount
+            return Disposition("claimed" if changed else "superseded")
+
+    def complete_operation(self, public_id, operation_type, token, result=None, diagnostic=None, manual=False):
+        with self.transaction(immediate=True) as c:
+            changed=c.execute("UPDATE storefront_operations SET state=?,result=?,diagnostic=?,error=?,claim_token=NULL,lease_expires_at=NULL,updated_at=? WHERE order_id=(SELECT id FROM storefront_orders WHERE public_id=?) AND operation_type=? AND state='running' AND claim_token=?",("manual_resolution" if manual else "complete",result,diagnostic,diagnostic,now(),public_id,operation_type,token)).rowcount
+            return Disposition("manual_resolution" if manual and changed else "already_complete" if changed else "superseded")
     def finalize_storefront_sale(self,public_id,source="stripe_webhook"):
         with self.transaction(immediate=True) as c:
             order=c.execute("SELECT * FROM storefront_orders WHERE public_id=?",(public_id,)).fetchone()
