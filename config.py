@@ -1,4 +1,4 @@
-import os
+import os, re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -48,3 +48,16 @@ class Config:
     stripe_cancel_url: str = os.getenv("STRIPE_CANCEL_URL", "http://127.0.0.1:5000/shop/order/{ORDER_ID}/cancel")
     stripe_fake_mode: bool = env_bool("STRIPE_FAKE_MODE", True)
     reservation_seconds: int = int(os.getenv("STOREFRONT_RESERVATION_SECONDS", "1800"))
+    stripe_shipping_countries: tuple = tuple(
+        country.strip().upper() for country in os.getenv("STRIPE_SHIPPING_COUNTRIES", "US").split(",")
+        if country.strip()
+    )
+
+    def __post_init__(self):
+        # This milestone is deliberately test-mode only.  Default deny even if
+        # fake mode is enabled so a live credential cannot sit unnoticed.
+        if self.stripe_secret_key.strip().startswith("sk_live_"):
+            raise ValueError("Live Stripe secret keys are not supported")
+        if not self.stripe_shipping_countries or any(
+                not re.fullmatch(r"[A-Z]{2}", value) for value in self.stripe_shipping_countries):
+            raise ValueError("Stripe shipping countries must be two-letter country codes")

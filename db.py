@@ -224,6 +224,7 @@ class Database:
             cur=c.execute("INSERT INTO storefront_orders(public_id,item_id,price_snapshot,currency_snapshot,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",(public_id,item["id"],item["price"],item["currency"],"checkout_pending",stamp,stamp))
             rid=c.execute("INSERT INTO item_reservations(item_id,order_id,state,expires_at,created_at,updated_at) VALUES(?,?,'open',?,?,?)",(item["id"],cur.lastrowid,expiry,stamp,stamp)).lastrowid
             c.execute("UPDATE storefront_orders SET reservation_id=? WHERE id=?",(rid,cur.lastrowid))
+            self._event(c,cur.lastrowid,None,"checkout_pending","shopper","order_created")
             return self.get_order(public_id,c)
     def get_order(self, public_id, con=None):
         own=con is None; con=con or self.connect(); row=con.execute("SELECT * FROM storefront_orders WHERE public_id=?",(public_id,)).fetchone(); result=dict(row) if row else None
@@ -233,24 +234,41 @@ class Database:
         with self.connect() as con:
             row=con.execute("SELECT * FROM storefront_orders WHERE stripe_checkout_session_id=? OR stripe_payment_intent_id=?",(session_id or "",payment_intent_id or "")).fetchone()
             return dict(row) if row else None
-    def attach_checkout(self, public_id, session_id, payment_intent_id=None):
+    def _event(self,c,order_id,old,new,source,category):
+        if old!=new or category:
+            c.execute("INSERT INTO storefront_order_events(order_id,from_state,to_state,source,category,created_at) VALUES(?,?,?,?,?,?)",(order_id,old,new,source,category,now()))
+    def attach_checkout(self, public_id, session_id, payment_intent_id=None, source="shopper"):
         with self.transaction(immediate=True) as c:
+            before=c.execute("SELECT id,state FROM storefront_orders WHERE public_id=?",(public_id,)).fetchone()
             c.execute("UPDATE storefront_orders SET stripe_checkout_session_id=COALESCE(stripe_checkout_session_id,?),stripe_payment_intent_id=COALESCE(stripe_payment_intent_id,?),state=CASE WHEN state='checkout_pending' THEN 'authorization_pending' ELSE state END,updated_at=? WHERE public_id=?",(session_id,payment_intent_id,now(),public_id))
+            after=self.get_order(public_id,c); self._event(c,before["id"],before["state"],after["state"],source,"checkout_attached")
+            return after
+    def attach_payment_intent(self,public_id,payment_intent_id,fulfillment=None):
+        fulfillment={k:v for k,v in (fulfillment or {}).items() if k in {"customer_email","shipping_name","shipping_line1","shipping_line2","shipping_city","shipping_state","shipping_postal_code","shipping_country","shipping_phone"}}
+        with self.transaction(immediate=True) as c:
+            row=c.execute("SELECT id,stripe_payment_intent_id,state FROM storefront_orders WHERE public_id=?",(public_id,)).fetchone()
+            if not row: raise ValueError("Order not found")
+            if row["stripe_payment_intent_id"] and row["stripe_payment_intent_id"]!=payment_intent_id: raise ValueError("Conflicting PaymentIntent")
+            values={"stripe_payment_intent_id":payment_intent_id,**fulfillment,"updated_at":now()}
+            c.execute("UPDATE storefront_orders SET "+",".join(f"{k}=?" for k in values)+" WHERE id=?",[*values.values(),row["id"]])
+            self._event(c,row["id"],row["state"],row["state"],"stripe_webhook","payment_intent_attached")
             return self.get_order(public_id,c)
-    def transition_order(self, public_id, state, payment_state=None, error=None, conflict=None):
+    def transition_order(self, public_id, state, payment_state=None, error=None, conflict=None, source="maintenance", category="state_transition"):
         with self.transaction(immediate=True) as c:
             row=c.execute("SELECT * FROM storefront_orders WHERE public_id=?",(public_id,)).fetchone()
             if not row: raise ValueError("Order not found")
             if state!=row["state"] and state not in self.ORDER_TRANSITIONS.get(row["state"],set()): raise ValueError(f"Invalid order transition {row['state']} to {state}")
             c.execute("UPDATE storefront_orders SET state=?,payment_state=COALESCE(?,payment_state),operation_error=?,conflict_details=COALESCE(?,conflict_details),updated_at=? WHERE id=?",(state,payment_state,error,conflict,now(),row["id"]))
+            self._event(c,row["id"],row["state"],state,source,category)
             return self.get_order(public_id,c)
-    def release_order(self, public_id, state, reason):
+    def release_order(self, public_id, state, reason, source="maintenance"):
         with self.transaction(immediate=True) as c:
             row=c.execute("SELECT * FROM storefront_orders WHERE public_id=?",(public_id,)).fetchone()
             if not row: return None
             if state!=row["state"] and state not in self.ORDER_TRANSITIONS.get(row["state"],set()): raise ValueError("Invalid order transition")
             c.execute("UPDATE storefront_orders SET state=?,updated_at=? WHERE id=?",(state,now(),row["id"]))
             c.execute("UPDATE item_reservations SET state=?,close_reason=?,updated_at=? WHERE order_id=? AND state='open'",("expired" if state=="expired" else "released",reason,now(),row["id"]))
+            self._event(c,row["id"],row["state"],state,source,"reservation_released")
             return self.get_order(public_id,c)
     def expire_reservations(self, limit=100):
         with self.transaction(immediate=True) as c:
@@ -258,14 +276,20 @@ class Database:
             for row in rows:
                 c.execute("UPDATE item_reservations SET state='expired',close_reason='expired',updated_at=? WHERE order_id=?",(now(),row["order_id"]))
                 c.execute("UPDATE storefront_orders SET state='expired',updated_at=? WHERE id=? AND state IN ('checkout_pending','authorization_pending')",(now(),row["order_id"]))
+                order=c.execute("SELECT state FROM storefront_orders WHERE id=?",(row["order_id"],)).fetchone()
+                self._event(c,row["order_id"],"authorization_pending",order["state"],"maintenance","reservation_expired")
             return len(rows)
     def claim_webhook(self,event_id,event_type):
         with self.transaction(immediate=True) as c:
             try: c.execute("INSERT INTO stripe_webhook_events(event_id,event_type,state,created_at,updated_at) VALUES(?,?,'processing',?,?)",(event_id,event_type,now(),now())); return True
-            except sqlite3.IntegrityError: return False
+            except sqlite3.IntegrityError:
+                row=c.execute("SELECT state FROM stripe_webhook_events WHERE event_id=?",(event_id,)).fetchone()
+                if row and row["state"]=="failed":
+                    c.execute("UPDATE stripe_webhook_events SET state='processing',attempts=attempts+1,error=NULL,updated_at=? WHERE event_id=?",(now(),event_id)); return True
+                return False
     def finish_webhook(self,event_id,error=None):
         with self.transaction() as c: c.execute("UPDATE stripe_webhook_events SET state=?,error=?,updated_at=? WHERE event_id=?",("failed" if error else "processed",error,now(),event_id))
-    def finalize_storefront_sale(self,public_id):
+    def finalize_storefront_sale(self,public_id,source="stripe_webhook"):
         with self.transaction(immediate=True) as c:
             order=c.execute("SELECT * FROM storefront_orders WHERE public_id=?",(public_id,)).fetchone()
             if not order: raise ValueError("Order not found")
@@ -277,7 +301,32 @@ class Database:
             c.execute("UPDATE items SET quantity=0,status='Sold',storefront_visible=0,updated_at=? WHERE id=?",(now(),order["item_id"]))
             c.execute("UPDATE storefront_orders SET state='sold',payment_state='captured',updated_at=? WHERE id=?",(now(),order["id"]))
             c.execute("UPDATE item_reservations SET state='closed',close_reason='sold',updated_at=? WHERE order_id=?",(now(),order["id"]))
+            self._event(c,order["id"],order["state"],"sold",source,"inventory_sold")
             return self.get_order(public_id,c)
+
+    def seller_orders(self,filters,page=1,per_page=25):
+        clauses=[]; args=[]
+        mapping={"state":"o.state","payment_state":"o.payment_state","sku":"i.sku","order_id":"o.public_id"}
+        for key,column in mapping.items():
+            if filters.get(key): clauses.append(f"{column}=?"); args.append(filters[key])
+        if filters.get("date"):
+            clauses.append("substr(o.created_at,1,10)=?"); args.append(filters["date"])
+        where=(" WHERE "+" AND ".join(clauses)) if clauses else ""
+        with self.connect() as c:
+            total=c.execute("SELECT COUNT(*) FROM storefront_orders o JOIN items i ON i.id=o.item_id"+where,args).fetchone()[0]
+            rows=c.execute("""SELECT o.*,i.sku,i.title,r.state reservation_state,r.expires_at,
+                EXISTS(SELECT 1 FROM storefront_operations op WHERE op.order_id=o.id AND op.state IN ('failed','manual_resolution')) operation_attention
+                FROM storefront_orders o JOIN items i ON i.id=o.item_id LEFT JOIN item_reservations r ON r.order_id=o.id"""+where+" ORDER BY o.created_at DESC,o.id DESC LIMIT ? OFFSET ?",[*args,per_page,(page-1)*per_page]).fetchall()
+            return [dict(x) for x in rows],total
+    def seller_order(self,public_id):
+        with self.connect() as c:
+            row=c.execute("""SELECT o.*,i.sku,i.title,i.description,i.condition,i.brand,i.size,i.color,
+                i.ebay_listing_id,i.ebay_offer_id,i.ebay_publication_state,r.state reservation_state,r.expires_at,r.close_reason
+                FROM storefront_orders o JOIN items i ON i.id=o.item_id LEFT JOIN item_reservations r ON r.order_id=o.id WHERE o.public_id=?""",(public_id,)).fetchone()
+            if not row:return None
+            result=dict(row); result["operations"]=[dict(x) for x in c.execute("SELECT * FROM storefront_operations WHERE order_id=? ORDER BY created_at,id",(row["id"],))]
+            result["events"]=[dict(x) for x in c.execute("SELECT * FROM storefront_order_events WHERE order_id=? ORDER BY created_at,id",(row["id"],))]
+            return result
     def process_order_line(self,order_id,line_id,sku,listing_id,quantity,payment,fulfillment,raw):
         """Deduplicate an order line and atomically reduce immediately-visible stock."""
         with self.transaction(immediate=True) as c:

@@ -139,3 +139,22 @@ reservation cleanup, and documented staff procedures for every manual-resolution
 case. Review cancellation, capture failure, eBay withdrawal failure, expiry,
 retry, and cross-channel conflict queues routinely; a redirect success page is
 never evidence of payment.
+
+## Stripe sandbox checkout procedure
+
+1. Create or select a Stripe sandbox and obtain its `sk_test_` secret key.
+2. Set `STRIPE_FAKE_MODE=false`, set `STRIPE_SECRET_KEY` to that test key, and
+   configure `STRIPE_SHIPPING_COUNTRIES` (the example defaults to `US`). Live
+   `sk_live_` keys are rejected at startup.
+3. Run `stripe listen --forward-to http://127.0.0.1:5000/stripe/webhook` and copy
+   the CLI-provided `whsec_...` signing secret into `.env` as
+   `STRIPE_WEBHOOK_SECRET`.
+4. Start Flask, publish a disposable item (mock withdrawal is supported), and
+   buy it through Checkout with Stripe's official test card data.
+5. Observe authorization, confirmed eBay withdrawal, capture, sold inventory,
+   and the audit timeline in the authenticated `/orders` dashboard.
+
+Checkout accepts cards only, uses manual capture, and collects email and a
+shipping address. Shipping fees and tax pricing remain unfinished: the total is
+only the server-side item-price snapshot. The Stripe SDK/API contract is pinned
+by `requirements.txt`; webhook fixtures must be reviewed when that pin changes.

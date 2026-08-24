@@ -15,6 +15,7 @@ from integrations.ebay.client import EbayClient
 from integrations.ebay.oauth import OAuthManager
 from integrations.ebay.photos import EbayImagePublisher
 from integrations.stripe import StripeAdapter, FakeStripeAdapter, StripeIntegrationError
+from order_service import OrderService
 
 IMAGE_SIGNATURES={"jpg":lambda b:b.startswith(b"\xff\xd8\xff"),"jpeg":lambda b:b.startswith(b"\xff\xd8\xff"),"png":lambda b:b.startswith(b"\x89PNG\r\n\x1a\n"),"gif":lambda b:b.startswith((b"GIF87a",b"GIF89a")),"webp":lambda b:len(b)>=12 and b[:4]==b"RIFF" and b[8:12]==b"WEBP"}
 
@@ -57,6 +58,7 @@ def create_app(config=None, http=None, stripe_adapter=None):
             overrides["marketplace_mock_mode"]=False
             return real_components(overrides)[1],item
         raise EbayError("classification_required","Choose an eBay integration mode before operating on this item")
+    order_service=OrderService(db,stripe_gateway,resolve_ebay,cfg)
     def adapters():
         return {"ebay": MockEbayAdapter(cfg,db) if cfg.marketplace_mock_mode else real_components()[1]}
     def item_or_404(item_id): return db.get_item(item_id) or abort(404)
@@ -72,7 +74,10 @@ def create_app(config=None, http=None, stripe_adapter=None):
     public_endpoints={"shop","shop_item","media","checkout","order_status","order_success","order_cancel","fake_complete_order","fake_cancel_order","stripe_webhook","static","login"}
     @app.before_request
     def seller_guard():
-        if not cfg.seller_username or not cfg.seller_password_hash: return
+        # Order fulfillment data is never public, even on an incompletely
+        # configured development install where the legacy seller UI is open.
+        always_protected={"orders","order_detail","seller_cancel_order","seller_retry_order"}
+        if request.endpoint not in always_protected and (not cfg.seller_username or not cfg.seller_password_hash): return
         if request.endpoint in public_endpoints: return
         if not session.get("seller_authenticated"):
             return redirect(url_for("login",next=request.full_path if request.method=="GET" else ""))
@@ -215,55 +220,13 @@ def create_app(config=None, http=None, stripe_adapter=None):
         return render_template("shop_item.html",item=item)
     @app.post("/shop/item/<sku>/checkout")
     def checkout(sku):
-        # The route intentionally consumes no client-controlled commercial data.
         prior_id=(session.get("checkout_orders") or {}).get(sku)
-        prior=db.get_order(prior_id) if prior_id else None
-        if prior and prior["state"] in ("checkout_pending","authorization_pending") and prior.get("stripe_checkout_session_id"):
-            if cfg.stripe_fake_mode:
-                return redirect(url_for("order_status",public_id=prior["public_id"]),code=303)
-            recovered=stripe_gateway.retrieve_session(prior["stripe_checkout_session_id"])
-            return redirect(recovered["url"] if isinstance(recovered,dict) else recovered.url,code=303)
-        try: order=db.create_storefront_order(sku,cfg.reservation_seconds)
+        try: order,provider_url=order_service.create_checkout(sku,prior_id)
         except ValueError: abort(409,"This piece is no longer available")
+        except StripeIntegrationError: abort(503,"Checkout is temporarily unavailable")
         checkout_orders=dict(session.get("checkout_orders") or {}); checkout_orders[sku]=order["public_id"]; session["checkout_orders"]=checkout_orders
-        item=db.get_item_by_sku(sku)
-        try:
-            result=stripe_gateway.create_checkout(order,item,cfg.stripe_success_url.replace("{ORDER_ID}",order["public_id"]),cfg.stripe_cancel_url.replace("{ORDER_ID}",order["public_id"]))
-            db.attach_checkout(order["public_id"],result["id"],result.get("payment_intent"))
-            return redirect(result["url"],code=303)
-        except StripeIntegrationError as exc:
-            # Ambiguous creation is retained for recovery; a definite failure is safe to release.
-            if exc.ambiguous: db.transition_order(order["public_id"],"manual_resolution",error=json.dumps(exc.safe_dict()))
-            else: db.release_order(order["public_id"],"cancelled","checkout creation failed")
-            abort(503,"Checkout is temporarily unavailable")
-
-    def process_authorization(order):
-        if order["state"] in ("sold","cancelled","manual_resolution"): return order
-        if order["state"] in ("checkout_pending","authorization_pending"):
-            order=db.transition_order(order["public_id"],"authorized",payment_state="authorized")
-        item=db.get_item(order["item_id"])
-        if item["status"]=="Sold" or item["quantity"]<1:
-            db.transition_order(order["public_id"],"authorization_cancel_pending",conflict="eBay/local inventory sold first")
-            try:
-                stripe_gateway.cancel(order["stripe_payment_intent_id"],f"cancel:{order['public_id']}")
-                return db.release_order(order["public_id"],"unavailable","inventory sold elsewhere")
-            except StripeIntegrationError as exc: return db.transition_order(order["public_id"],"manual_resolution",error=json.dumps(exc.safe_dict()))
-        if order["state"]=="authorized": order=db.transition_order(order["public_id"],"ebay_withdrawal_pending")
-        try:
-            if item.get("ebay_publication_state")=="published": resolve_ebay(item)[0].delist(item)
-            order=db.transition_order(order["public_id"],"capture_pending")
-        except EbayError as exc:
-            db.transition_order(order["public_id"],"authorization_cancel_pending",error=json.dumps(exc.safe_dict()))
-            try:
-                stripe_gateway.cancel(order["stripe_payment_intent_id"],f"cancel:{order['public_id']}")
-                return db.release_order(order["public_id"],"cancelled","eBay withdrawal failed")
-            except StripeIntegrationError as cancel_error: return db.transition_order(order["public_id"],"manual_resolution",error=json.dumps(cancel_error.safe_dict()))
-        try:
-            stripe_gateway.capture(order["stripe_payment_intent_id"],f"capture:{order['public_id']}")
-            db.transition_order(order["public_id"],"paid",payment_state="captured")
-            return db.finalize_storefront_sale(order["public_id"])
-        except StripeIntegrationError as exc:
-            return db.transition_order(order["public_id"],"manual_resolution",error=json.dumps(exc.safe_dict()))
+        destination=url_for("order_status",public_id=order["public_id"]) if cfg.stripe_fake_mode else provider_url
+        return redirect(destination,code=303)
 
     @app.post("/stripe/webhook")
     def stripe_webhook():
@@ -273,15 +236,23 @@ def create_app(config=None, http=None, stripe_adapter=None):
         event_id=str(event.get("id", "")); event_type=str(event.get("type", ""))
         if not event_id or not db.claim_webhook(event_id,event_type): return "",200
         try:
-            obj=(event.get("data") or {}).get("object") or {}; sid=obj.get("id") if event_type.startswith("checkout.session") else obj.get("checkout_session"); pi=obj.get("payment_intent") or (obj.get("id") if event_type.startswith("payment_intent") else None)
-            order=db.find_order_by_stripe(sid,pi)
-            if order and event_type in ("checkout.session.completed","checkout.session.async_payment_succeeded","payment_intent.amount_capturable_updated"):
-                process_authorization(order)
-            elif order and event_type in ("checkout.session.expired","checkout.session.async_payment_failed","payment_intent.canceled") and order["state"] in ("checkout_pending","authorization_pending"):
-                db.release_order(order["public_id"],"expired" if event_type=="checkout.session.expired" else "cancelled",event_type)
+            obj=(event.get("data") or {}).get("object") or {}
+            sid=obj.get("id") if event_type.startswith("checkout.session") else obj.get("checkout_session")
+            metadata=obj.get("metadata") or {}; reference=obj.get("client_reference_id") or metadata.get("order")
+            pi=obj.get("payment_intent") or (obj.get("id") if event_type.startswith("payment_intent") else None)
+            pi_id=pi.get("id") if isinstance(pi,dict) else pi
+            order=db.find_order_by_stripe(sid,pi_id) or (db.get_order(reference) if reference else None)
+            if order and sid: order=db.attach_checkout(order["public_id"],sid,pi_id,source="stripe_webhook")
+            if order and event_type in ("checkout.session.completed","payment_intent.amount_capturable_updated"):
+                session_obj=obj if event_type.startswith("checkout.session") else None
+                intent=obj if event_type.startswith("payment_intent") else (pi if isinstance(pi,dict) else None)
+                order_service.process_authorization(order,session_obj,intent)
+            elif order and event_type in ("checkout.session.expired","payment_intent.canceled") and order["state"] in ("checkout_pending","authorization_pending"):
+                db.release_order(order["public_id"],"expired" if event_type=="checkout.session.expired" else "cancelled",event_type,source="stripe_webhook")
             db.finish_webhook(event_id); return "",200
         except Exception as exc:
-            app.logger.warning("Stripe event processing failed: %s",type(exc).__name__); db.finish_webhook(event_id,"Processing failed"); return "",500
+            app.logger.warning("Stripe event processing failed: %s",type(exc).__name__)
+            db.finish_webhook(event_id,"Processing failed"); return "",500
 
     def fake_development_mode(): return cfg.stripe_fake_mode and cfg.environment != "production"
     def render_order(public_id, **context):
@@ -299,7 +270,8 @@ def create_app(config=None, http=None, stripe_adapter=None):
         order=db.get_order(public_id) or abort(404)
         if order["state"]=="sold": return redirect(url_for("order_status",public_id=public_id),code=303)
         if order["state"] not in ("checkout_pending","authorization_pending"): abort(409,"Order can no longer be completed")
-        process_authorization(order)
+        # Fake checkout models an already-authorized manual-capture intent.
+        order_service.process_authorization(order,payment_intent={"id":order["stripe_payment_intent_id"],"status":"requires_capture","capture_method":"manual"},source="shopper")
         return redirect(url_for("order_status",public_id=public_id),code=303)
 
     @app.post("/shop/order/<public_id>/cancel-checkout")
@@ -308,10 +280,41 @@ def create_app(config=None, http=None, stripe_adapter=None):
         order=db.get_order(public_id) or abort(404)
         if order["state"]=="cancelled": return redirect(url_for("order_status",public_id=public_id),code=303)
         if order["state"] not in ("checkout_pending","authorization_pending"): abort(409,"Order can no longer be cancelled")
-        if order.get("stripe_payment_intent_id"):
-            stripe_gateway.cancel(order["stripe_payment_intent_id"],f"cancel:{order['public_id']}")
-        db.release_order(public_id,"cancelled","cancelled by shopper")
+        order_service.seller_cancel(public_id)
         return redirect(url_for("order_status",public_id=public_id),code=303)
+
+    @app.get("/orders")
+    def orders():
+        allowed={"state","payment_state","date","sku","order_id","page"}
+        if set(request.args)-allowed: abort(400,"Unknown order filter")
+        states=set(db.ORDER_TRANSITIONS); payment_states={"unpaid","authorized","captured","cancelled"}
+        filters={key:request.args.get(key,"").strip() for key in allowed-{"page"}}
+        if filters["state"] and filters["state"] not in states: abort(400,"Invalid order state")
+        if filters["payment_state"] and filters["payment_state"] not in payment_states: abort(400,"Invalid payment state")
+        if filters["date"] and not re.fullmatch(r"\d{4}-\d{2}-\d{2}",filters["date"]): abort(400,"Invalid date")
+        if any(len(filters[x])>100 for x in ("sku","order_id")): abort(400,"Order filter is too long")
+        try: page=int(request.args.get("page","1"))
+        except ValueError: abort(400,"Invalid page")
+        if page<1 or page>10000: abort(400,"Invalid page")
+        rows,total=db.seller_orders(filters,page,25)
+        return render_template("orders.html",orders=rows,filters=filters,page=page,pages=max(1,(total+24)//25),states=sorted(states),payment_states=sorted(payment_states))
+
+    @app.get("/orders/<public_id>")
+    def order_detail(public_id): return render_template("order_detail.html",order=db.seller_order(public_id) or abort(404))
+    def confirmed():
+        if request.form.get("confirmation") != "CONFIRM": abort(400,"Type CONFIRM to continue")
+    @app.post("/orders/<public_id>/cancel")
+    def seller_cancel_order(public_id):
+        confirmed()
+        try: order_service.seller_cancel(public_id)
+        except ValueError: abort(409,"Order cannot be cancelled")
+        return redirect(url_for("order_detail",public_id=public_id),code=303)
+    @app.post("/orders/<public_id>/retry")
+    def seller_retry_order(public_id):
+        confirmed()
+        try: order_service.retry(public_id)
+        except ValueError: abort(409,"Order cannot be retried")
+        return redirect(url_for("order_detail",public_id=public_id),code=303)
 
     @app.post("/maintenance/storefront")
     def storefront_maintenance():
@@ -496,7 +499,7 @@ def create_app(config=None, http=None, stripe_adapter=None):
         except EbayError as error:
             flash(json.dumps(error.safe_dict()),"error")
         return redirect(url_for("sandbox"))
-    app.extensions.update(vintage_db=db,stripe_adapter=stripe_gateway,ebay_components=real_components,ebay_metadata=metadata_component(),ebay_metadata_factory=metadata_component,marketplace_adapters=adapters)
+    app.extensions.update(vintage_db=db,stripe_adapter=stripe_gateway,order_service=order_service,ebay_components=real_components,ebay_metadata=metadata_component(),ebay_metadata_factory=metadata_component,marketplace_adapters=adapters)
     return app
 
 if __name__ == "__main__":
