@@ -1,8 +1,11 @@
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from app import create_app
 from config import Config
+from integrations.stripe import FakeStripeAdapter, StripeIntegrationError
 
 
 def csrf(client):
@@ -105,3 +108,59 @@ def test_fake_actions_are_disabled_in_real_or_production_mode(tmp_path):
         client = app.test_client()
         for action in ("complete", "cancel-checkout"):
             assert client.post(f"/shop/order/missing/{action}", data=csrf(client)).status_code == 404
+
+
+@pytest.mark.parametrize(
+    ("action", "order_state", "reservation_state", "item_quantity"),
+    (("complete", "sold", "closed", 0),
+     ("cancel-checkout", "cancelled", "released", 1)),
+)
+def test_fake_checkout_recovery_after_restart_preserves_order_and_state_machine(
+        tmp_path, action, order_state, reservation_state, item_quantity):
+    scenario = tmp_path / action
+    scenario.mkdir()
+    secret_key = "restart-regression-secret"
+    first_app, _, _ = setup_store(scenario, secret_key=secret_key)
+    first_client, public_id = start_checkout(first_app)
+    with first_client.session_transaction() as browser_session:
+        preserved_session = dict(browser_session)
+
+    restarted_config = replace(
+        Config(), database_path=str(scenario / "store.sqlite"),
+        secret_key=secret_key, stripe_fake_mode=True, environment="sandbox")
+    restarted_app = create_app(restarted_config)
+    restarted_db = restarted_app.extensions["vintage_db"]
+    restarted_client = restarted_app.test_client()
+    with restarted_client.session_transaction() as browser_session:
+        browser_session.update(preserved_session)
+
+    retry = restarted_client.post(
+        "/shop/item/TEST-COAT/checkout", data={"csrf_token": preserved_session["csrf_token"]})
+    assert retry.status_code == 303
+    assert retry.headers["Location"] == f"/shop/order/{public_id}"
+    with restarted_db.connect() as con:
+        assert con.execute("SELECT COUNT(*) FROM storefront_orders").fetchone()[0] == 1
+        assert con.execute("SELECT COUNT(*) FROM item_reservations").fetchone()[0] == 1
+
+    status_page = restarted_client.get(retry.headers["Location"])
+    assert b"Complete Purchase" in status_page.data
+    assert b"Cancel Checkout" in status_page.data
+    outcome = restarted_client.post(
+        f"/shop/order/{public_id}/{action}", data=csrf(restarted_client))
+    assert outcome.status_code == 303
+    assert restarted_db.get_order(public_id)["state"] == order_state
+    assert reservation(restarted_db, public_id)["state"] == reservation_state
+    assert restarted_db.get_item_by_sku("TEST-COAT")["quantity"] == item_quantity
+
+
+def test_fake_stripe_unknown_session_is_safely_classified():
+    adapter = FakeStripeAdapter(Config())
+
+    with pytest.raises(StripeIntegrationError) as caught:
+        adapter.retrieve_session("cs_test_missing")
+
+    assert caught.value.safe_dict() == {
+        "kind": "session_not_found",
+        "message": "Checkout session was not found",
+        "ambiguous": False,
+    }
