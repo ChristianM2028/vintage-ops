@@ -69,7 +69,7 @@ def create_app(config=None, http=None, stripe_adapter=None):
         expected=session.get("csrf_token")
         if request.method=="POST" and request.endpoint!="stripe_webhook" and (not expected or not secrets.compare_digest(expected, request.form.get("csrf_token", ""))): abort(400,"Invalid CSRF token")
 
-    public_endpoints={"shop","shop_item","media","checkout","order_status","order_success","order_cancel","stripe_webhook","static","login"}
+    public_endpoints={"shop","shop_item","media","checkout","order_status","order_success","order_cancel","fake_complete_order","fake_cancel_order","stripe_webhook","static","login"}
     @app.before_request
     def seller_guard():
         if not cfg.seller_username or not cfg.seller_password_hash: return
@@ -281,12 +281,35 @@ def create_app(config=None, http=None, stripe_adapter=None):
         except Exception as exc:
             app.logger.warning("Stripe event processing failed: %s",type(exc).__name__); db.finish_webhook(event_id,"Processing failed"); return "",500
 
+    def fake_development_mode(): return cfg.stripe_fake_mode and cfg.environment != "production"
+    def render_order(public_id, **context):
+        return render_template("order_status.html",order=db.get_order(public_id) or abort(404),fake_development_mode=fake_development_mode(),**context)
     @app.get("/shop/order/<public_id>")
-    def order_status(public_id): return render_template("order_status.html",order=db.get_order(public_id) or abort(404))
+    def order_status(public_id): return render_order(public_id)
     @app.get("/shop/order/<public_id>/success")
-    def order_success(public_id): return render_template("order_status.html",order=db.get_order(public_id) or abort(404),redirect_kind="success")
+    def order_success(public_id): return render_order(public_id,redirect_kind="success")
     @app.get("/shop/order/<public_id>/cancel")
-    def order_cancel(public_id): return render_template("order_status.html",order=db.get_order(public_id) or abort(404),redirect_kind="cancel")
+    def order_cancel(public_id): return render_order(public_id,redirect_kind="cancel")
+
+    @app.post("/shop/order/<public_id>/complete")
+    def fake_complete_order(public_id):
+        if not fake_development_mode(): abort(404)
+        order=db.get_order(public_id) or abort(404)
+        if order["state"]=="sold": return redirect(url_for("order_status",public_id=public_id),code=303)
+        if order["state"] not in ("checkout_pending","authorization_pending"): abort(409,"Order can no longer be completed")
+        process_authorization(order)
+        return redirect(url_for("order_status",public_id=public_id),code=303)
+
+    @app.post("/shop/order/<public_id>/cancel-checkout")
+    def fake_cancel_order(public_id):
+        if not fake_development_mode(): abort(404)
+        order=db.get_order(public_id) or abort(404)
+        if order["state"]=="cancelled": return redirect(url_for("order_status",public_id=public_id),code=303)
+        if order["state"] not in ("checkout_pending","authorization_pending"): abort(409,"Order can no longer be cancelled")
+        if order.get("stripe_payment_intent_id"):
+            stripe_gateway.cancel(order["stripe_payment_intent_id"],f"cancel:{order['public_id']}")
+        db.release_order(public_id,"cancelled","cancelled by shopper")
+        return redirect(url_for("order_status",public_id=public_id),code=303)
 
     @app.post("/maintenance/storefront")
     def storefront_maintenance():
