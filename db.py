@@ -50,7 +50,7 @@ class Database:
         finally: con.close()
     def create_item(self, photos=None, **v):
         """Atomically allocate the next human-readable SKU and insert photo metadata."""
-        stamp=now(); fields=("title","description","price","currency","quantity","condition","brand","size","color","category","category_name","photo_urls","item_specifics")
+        stamp=now(); fields=("title","description","price","currency","quantity","condition","brand","size","color","category","category_name","photo_urls","item_specifics","ebay_integration_mode","ebay_merchant_location_key","ebay_fulfillment_policy_id","ebay_payment_policy_id","ebay_return_policy_id","ebay_marketplace_id")
         vals=[json.dumps(v.get(k, [] if k=="photo_urls" else {})) if k in ("photo_urls","item_specifics") else v.get(k) for k in fields]
         with self.transaction(immediate=True) as c:
             # Explicit SKUs remain accepted for the isolated legacy Sandbox test
@@ -105,7 +105,7 @@ class Database:
             return [self.get_item(r["id"],c) for r in rows]
     def get_photos(self,item_id): return (self.get_item(item_id) or {}).get("photos",[])
     def update_item(self,item_id,**values):
-        allowed={"title","description","price","currency","quantity","condition","brand","size","color","category","category_name","photo_urls","item_specifics","ebay_sku","ebay_offer_id","ebay_listing_id","ebay_publication_state","ebay_sync_state","local_revision","synced_revision","publication_lock_token","publication_lock_expires_at","last_error","status","storefront_visible"}
+        allowed={"title","description","price","currency","quantity","condition","brand","size","color","category","category_name","photo_urls","item_specifics","ebay_sku","ebay_offer_id","ebay_listing_id","ebay_publication_state","ebay_sync_state","local_revision","synced_revision","publication_lock_token","publication_lock_expires_at","last_error","status","storefront_visible","ebay_integration_mode","ebay_merchant_location_key","ebay_fulfillment_policy_id","ebay_payment_policy_id","ebay_return_policy_id","ebay_marketplace_id"}
         if not values: return self.get_item(item_id)
         if set(values)-allowed: raise ValueError("Unsupported item field")
         for key in ("photo_urls","item_specifics"):
