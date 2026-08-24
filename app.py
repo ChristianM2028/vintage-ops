@@ -10,7 +10,7 @@ from integrations.ebay import EbayService, MockEbayAdapter, EbayError, SandboxSe
 from integrations.ebay.aspects import parse_aspects, parse_conditions, validate_specifics
 from integrations.ebay.client import EbayClient
 from integrations.ebay.oauth import OAuthManager
-from integrations.ebay.photos import PhotoPublisher
+from integrations.ebay.photos import EbayImagePublisher
 
 IMAGE_SIGNATURES={"jpg":lambda b:b.startswith(b"\xff\xd8\xff"),"jpeg":lambda b:b.startswith(b"\xff\xd8\xff"),"png":lambda b:b.startswith(b"\x89PNG\r\n\x1a\n"),"gif":lambda b:b.startswith((b"GIF87a",b"GIF89a")),"webp":lambda b:len(b)>=12 and b[:4]==b"RIFF" and b[8:12]==b"WEBP"}
 
@@ -48,6 +48,7 @@ def create_app(config=None, http=None):
                 raise EbayError("classification_required","This item is missing its persisted eBay seller configuration")
             overrides={key:item[column] for key,column in SNAPSHOT_FIELDS.items()}
             overrides["environment"]="sandbox" if mode=="ebay_sandbox" else "production"
+            overrides["marketplace_mock_mode"]=False
             return real_components(overrides)[1],item
         raise EbayError("classification_required","Choose an eBay integration mode before operating on this item")
     def adapters():
@@ -195,7 +196,7 @@ def create_app(config=None, http=None):
         try:
             adapter,item=resolve_ebay(item,establish=operation=="list")
             if operation in ("list","update") and item.get("ebay_integration_mode")!="local_mock" and item.get("photos"):
-                PhotoPublisher(adapter.cfg,db,http_session).publish(item); item=db.get_item(item_id)
+                EbayImagePublisher(adapter.cfg,db,adapter.client).publish(item); item=db.get_item(item_id)
             item=getattr(adapter,operation)(item); flash(success,"success")
         except EbayError as e: db.update_item(item_id,last_error=json.dumps(e.safe_dict())); flash(str(e),"error")
         return redirect(url_for("item_page",item_id=item_id))
@@ -219,18 +220,51 @@ def create_app(config=None, http=None):
                 if price<=0 or price.as_tuple().exponent < -2 or quantity<0: raise ValueError
             except (ValueError,InvalidOperation): errors.append("Price and quantity must be valid non-negative values.")
             specifics,aspect_fields,conditions,metadata_errors=validate_metadata_form(values); errors.extend(metadata_errors)
-            replacement=[]; saved=[]
-            files=[f for f in request.files.getlist("photos") if f and f.filename]
-            if len(files)>cfg.max_photo_count: errors.append(f"You may upload at most {cfg.max_photo_count} photos.")
-            for f in files:
-                ext=Path(f.filename).suffix.lower().lstrip("."); data=f.read(cfg.max_upload_size+1)
-                if ext not in cfg.permitted_image_extensions or ext not in IMAGE_SIGNATURES or not IMAGE_SIGNATURES[ext](data): errors.append(f"{f.filename}: invalid image type."); continue
-                if len(data)>cfg.max_upload_size: errors.append(f"{f.filename}: image is too large."); continue
-                replacement.append({"filename":f"{secrets.token_hex(20)}.{ext}","original_filename":Path(f.filename).name,"data":data})
+            prepared=[]; saved=[]; ordered=[]
+            current={p["id"]:p for p in item["photos"]}
+            # Reject foreign/stale IDs even when smuggled in a field name.
+            submitted_ids=set()
+            for key in request.form:
+                match=re.fullmatch(r"photo_(?:action|order)_(\d+)",key)
+                if match: submitted_ids.add(int(match.group(1)))
+            for key in request.files:
+                match=re.fullmatch(r"replace_photo_(\d+)",key)
+                if match: submitted_ids.add(int(match.group(1)))
+            if submitted_ids != set(current): errors.append("The submitted photo selection is stale or invalid.")
+            positions=[]
+            for pid,photo in current.items():
+                action=request.form.get(f"photo_action_{pid}")
+                if action not in {"retain","remove","replace"}: errors.append(f"{photo['original_filename']}: choose retain, remove, or replace."); continue
+                if action=="remove": continue
+                try: position=int(request.form.get(f"photo_order_{pid}",""))
+                except ValueError: position=-1
+                if position<1: errors.append(f"{photo['original_filename']}: enter a valid display position.")
+                upload=request.files.get(f"replace_photo_{pid}")
+                if action=="replace" and (not upload or not upload.filename): errors.append(f"{photo['original_filename']}: choose a replacement file."); continue
+                if action=="retain" and upload and upload.filename: errors.append(f"{photo['original_filename']}: select Replace to use that file."); continue
+                positions.append((position,{"id":pid} if action=="retain" else (upload,photo["original_filename"])))
+            if len([p for p,_ in positions])!=len(set(p for p,_ in positions)): errors.append("Each existing photo must have a unique display position.")
+            additions=[f for f in request.files.getlist("photos") if f and f.filename]
+            if len(positions)+len(additions)>cfg.max_photo_count: errors.append(f"You may upload at most {cfg.max_photo_count} photos in total.")
+            def prepare(upload, affected_name=None):
+                ext=Path(upload.filename).suffix.lower().lstrip("."); data=upload.read(cfg.max_upload_size+1); label=affected_name or upload.filename
+                if ext not in cfg.permitted_image_extensions or ext not in IMAGE_SIGNATURES or not IMAGE_SIGNATURES[ext](data): errors.append(f"{label}: invalid image type."); return None
+                if len(data)>cfg.max_upload_size: errors.append(f"{label}: image is too large."); return None
+                return {"filename":f"{secrets.token_hex(20)}.{ext}","original_filename":Path(upload.filename).name,"data":data}
+            for position,spec in sorted(positions,key=lambda x:x[0]):
+                if isinstance(spec,dict): ordered.append(spec)
+                else:
+                    made=prepare(spec[0],spec[1])
+                    if made: ordered.append(made); prepared.append(made)
+            for upload in additions:
+                made=prepare(upload)
+                if made: ordered.append(made); prepared.append(made)
             if not errors:
                 try:
-                    for p in replacement: (upload_dir/p["filename"]).write_bytes(p.pop("data")); saved.append(upload_dir/p["filename"])
-                    db.update_item_and_photos(item_id,{"title":request.form["title"].strip(),"description":request.form["description"].strip(),"price":f"{price:.2f}","quantity":quantity,"condition":request.form["condition"].strip(),"category":request.form["category"].strip(),"category_name":request.form["category_name"].strip(),"brand":values.get("brand","").strip(),"size":values.get("size","").strip(),"color":values.get("color","").strip(),"item_specifics":specifics},replacement or None)
+                    for p in prepared: (upload_dir/p["filename"]).write_bytes(p["data"]); saved.append(upload_dir/p["filename"])
+                    mutation=[{k:v for k,v in p.items() if k!="data"} for p in ordered]
+                    _,removed=db.mutate_item_photos(item_id,{"title":request.form["title"].strip(),"description":request.form["description"].strip(),"price":f"{price:.2f}","quantity":quantity,"condition":request.form["condition"].strip(),"category":request.form["category"].strip(),"category_name":request.form["category_name"].strip(),"brand":values.get("brand","").strip(),"size":values.get("size","").strip(),"color":values.get("color","").strip(),"item_specifics":specifics},mutation)
+                    for filename in removed: (upload_dir/filename).unlink(missing_ok=True)
                     flash("Edits saved. Synchronize to apply them to eBay.","success"); return redirect(url_for("item_page",item_id=item_id))
                 except Exception:
                     for path in saved: path.unlink(missing_ok=True)
@@ -245,7 +279,7 @@ def create_app(config=None, http=None):
             adapter,item=resolve_ebay(item,establish=True)
             for adapter in (adapter,):
                 if item.get("ebay_integration_mode")!="local_mock" and item.get("photos"):
-                    PhotoPublisher(adapter.cfg,db,http_session).publish(item); item=db.get_item(item_id)
+                    EbayImagePublisher(adapter.cfg,db,adapter.client).publish(item); item=db.get_item(item_id)
                 item=adapter.list(item)
             flash("Listed on every configured marketplace (eBay).","success")
         except EbayError as e: db.update_item(item_id,last_error=json.dumps(e.safe_dict())); flash("Not all marketplaces were listed: "+str(e),"error")
