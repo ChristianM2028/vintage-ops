@@ -1,6 +1,6 @@
 import json, os, sqlite3, secrets
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 STATUSES = ("Draft", "Active", "Sold", "Delisted")
 TRANSITIONS = {
@@ -71,6 +71,10 @@ class Database:
             result["item_specifics"]=json.loads(result.get("item_specifics") or "{}")
         if own: con.close()
         return result
+    def get_item_by_sku(self, sku):
+        with self.connect() as con:
+            row=con.execute("SELECT id FROM items WHERE sku=?",(sku,)).fetchone()
+            return self.get_item(row["id"],con) if row else None
     @staticmethod
     def _public_item(row, con):
         """Return the deliberately small, ID-free representation used by the shop."""
@@ -81,10 +85,14 @@ class Database:
         """Look up a visible product by its public SKU without returning internal IDs."""
         with self.connect() as con:
             row=con.execute("SELECT * FROM items WHERE sku=? AND storefront_visible=1",(sku,)).fetchone()
-            return self._public_item(row,con) if row else None
+            if not row: return None
+            item=self._public_item(row,con)
+            reserved=con.execute("SELECT 1 FROM item_reservations WHERE item_id=? AND state='open' AND expires_at>?",(row["id"],now())).fetchone()
+            item["availability"]="reserved" if reserved else ("available" if row["storefront_visible"] and row["status"]=="Active" and row["quantity"]>0 else "sold" if row["status"]=="Sold" or row["quantity"]<=0 else "unavailable")
+            return item
     def storefront_catalog(self, search=None, brand=None, size=None, min_price=None, max_price=None, sort="newest"):
         """Query visible, active inventory and return only storefront-safe fields."""
-        clauses=["storefront_visible=1","status='Active'"]; args=[]
+        clauses=["storefront_visible=1","status='Active'","quantity>0","NOT EXISTS (SELECT 1 FROM item_reservations r WHERE r.item_id=items.id AND r.state='open' AND r.expires_at>?)"]; args=[now()]
         if search:
             clauses.append("(LOWER(title) LIKE ? OR LOWER(description) LIKE ? OR LOWER(COALESCE(brand,'')) LIKE ?)")
             term=f"%{search.lower()}%"; args.extend((term,term,term))
@@ -192,6 +200,81 @@ class Database:
         return token
     def release_publication_lock(self,item_id,token):
         with self.transaction() as c: c.execute("UPDATE items SET publication_lock_token=NULL,publication_lock_expires_at=NULL WHERE id=? AND publication_lock_token=?",(item_id,token))
+    ORDER_TRANSITIONS={
+        "checkout_pending":{"authorization_pending","cancelled","expired","unavailable","manual_resolution"},
+        "authorization_pending":{"authorized","cancelled","expired","manual_resolution"},
+        "authorized":{"ebay_withdrawal_pending","capture_pending","authorization_cancel_pending","manual_resolution","unavailable"},
+        "ebay_withdrawal_pending":{"capture_pending","authorization_cancel_pending","manual_resolution"},
+        "capture_pending":{"paid","authorization_cancel_pending","manual_resolution"},
+        "paid":{"sold","manual_resolution"}, "authorization_cancel_pending":{"cancelled","unavailable","manual_resolution"},
+        "sold":{"manual_resolution"}, "cancelled":set(), "expired":set(), "unavailable":{"manual_resolution"}, "manual_resolution":set()
+    }
+    def create_storefront_order(self, sku, duration_seconds=1800):
+        stamp=now(); expiry=(datetime.now(timezone.utc)+timedelta(seconds=duration_seconds)).isoformat()
+        with self.transaction(immediate=True) as c:
+            item=c.execute("SELECT * FROM items WHERE sku=?",(sku,)).fetchone()
+            if not item or item["status"]!="Active" or not item["storefront_visible"] or item["quantity"]<1: raise ValueError("Item unavailable")
+            reservation=c.execute("SELECT order_id FROM item_reservations WHERE item_id=? AND state='open' AND expires_at>?",(item["id"],stamp)).fetchone()
+            if reservation: raise ValueError("Item reserved")
+            c.execute("UPDATE item_reservations SET state='expired',close_reason='expired',updated_at=? WHERE item_id=? AND state='open' AND expires_at<=?",(stamp,item["id"],stamp))
+            public_id=secrets.token_urlsafe(24)
+            cur=c.execute("INSERT INTO storefront_orders(public_id,item_id,price_snapshot,currency_snapshot,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",(public_id,item["id"],item["price"],item["currency"],"checkout_pending",stamp,stamp))
+            rid=c.execute("INSERT INTO item_reservations(item_id,order_id,state,expires_at,created_at,updated_at) VALUES(?,?,'open',?,?,?)",(item["id"],cur.lastrowid,expiry,stamp,stamp)).lastrowid
+            c.execute("UPDATE storefront_orders SET reservation_id=? WHERE id=?",(rid,cur.lastrowid))
+            return self.get_order(public_id,c)
+    def get_order(self, public_id, con=None):
+        own=con is None; con=con or self.connect(); row=con.execute("SELECT * FROM storefront_orders WHERE public_id=?",(public_id,)).fetchone(); result=dict(row) if row else None
+        if own: con.close()
+        return result
+    def find_order_by_stripe(self, session_id=None, payment_intent_id=None):
+        with self.connect() as con:
+            row=con.execute("SELECT * FROM storefront_orders WHERE stripe_checkout_session_id=? OR stripe_payment_intent_id=?",(session_id or "",payment_intent_id or "")).fetchone()
+            return dict(row) if row else None
+    def attach_checkout(self, public_id, session_id, payment_intent_id=None):
+        with self.transaction(immediate=True) as c:
+            c.execute("UPDATE storefront_orders SET stripe_checkout_session_id=COALESCE(stripe_checkout_session_id,?),stripe_payment_intent_id=COALESCE(stripe_payment_intent_id,?),state=CASE WHEN state='checkout_pending' THEN 'authorization_pending' ELSE state END,updated_at=? WHERE public_id=?",(session_id,payment_intent_id,now(),public_id))
+            return self.get_order(public_id,c)
+    def transition_order(self, public_id, state, payment_state=None, error=None, conflict=None):
+        with self.transaction(immediate=True) as c:
+            row=c.execute("SELECT * FROM storefront_orders WHERE public_id=?",(public_id,)).fetchone()
+            if not row: raise ValueError("Order not found")
+            if state!=row["state"] and state not in self.ORDER_TRANSITIONS.get(row["state"],set()): raise ValueError(f"Invalid order transition {row['state']} to {state}")
+            c.execute("UPDATE storefront_orders SET state=?,payment_state=COALESCE(?,payment_state),operation_error=?,conflict_details=COALESCE(?,conflict_details),updated_at=? WHERE id=?",(state,payment_state,error,conflict,now(),row["id"]))
+            return self.get_order(public_id,c)
+    def release_order(self, public_id, state, reason):
+        with self.transaction(immediate=True) as c:
+            row=c.execute("SELECT * FROM storefront_orders WHERE public_id=?",(public_id,)).fetchone()
+            if not row: return None
+            if state!=row["state"] and state not in self.ORDER_TRANSITIONS.get(row["state"],set()): raise ValueError("Invalid order transition")
+            c.execute("UPDATE storefront_orders SET state=?,updated_at=? WHERE id=?",(state,now(),row["id"]))
+            c.execute("UPDATE item_reservations SET state=?,close_reason=?,updated_at=? WHERE order_id=? AND state='open'",("expired" if state=="expired" else "released",reason,now(),row["id"]))
+            return self.get_order(public_id,c)
+    def expire_reservations(self, limit=100):
+        with self.transaction(immediate=True) as c:
+            rows=c.execute("SELECT order_id FROM item_reservations WHERE state='open' AND expires_at<=? LIMIT ?",(now(),limit)).fetchall()
+            for row in rows:
+                c.execute("UPDATE item_reservations SET state='expired',close_reason='expired',updated_at=? WHERE order_id=?",(now(),row["order_id"]))
+                c.execute("UPDATE storefront_orders SET state='expired',updated_at=? WHERE id=? AND state IN ('checkout_pending','authorization_pending')",(now(),row["order_id"]))
+            return len(rows)
+    def claim_webhook(self,event_id,event_type):
+        with self.transaction(immediate=True) as c:
+            try: c.execute("INSERT INTO stripe_webhook_events(event_id,event_type,state,created_at,updated_at) VALUES(?,?,'processing',?,?)",(event_id,event_type,now(),now())); return True
+            except sqlite3.IntegrityError: return False
+    def finish_webhook(self,event_id,error=None):
+        with self.transaction() as c: c.execute("UPDATE stripe_webhook_events SET state=?,error=?,updated_at=? WHERE event_id=?",("failed" if error else "processed",error,now(),event_id))
+    def finalize_storefront_sale(self,public_id):
+        with self.transaction(immediate=True) as c:
+            order=c.execute("SELECT * FROM storefront_orders WHERE public_id=?",(public_id,)).fetchone()
+            if not order: raise ValueError("Order not found")
+            if order["state"]=="sold": return self.get_order(public_id,c)
+            if order["state"] not in ("paid","capture_pending"): raise ValueError("Order is not captured")
+            item=c.execute("SELECT quantity,status FROM items WHERE id=?",(order["item_id"],)).fetchone()
+            if item["quantity"]<1 or item["status"]=="Sold":
+                c.execute("UPDATE storefront_orders SET state='manual_resolution',conflict_details='Inventory sold by another channel',updated_at=? WHERE id=?",(now(),order["id"])); return self.get_order(public_id,c)
+            c.execute("UPDATE items SET quantity=0,status='Sold',storefront_visible=0,updated_at=? WHERE id=?",(now(),order["item_id"]))
+            c.execute("UPDATE storefront_orders SET state='sold',payment_state='captured',updated_at=? WHERE id=?",(now(),order["id"]))
+            c.execute("UPDATE item_reservations SET state='closed',close_reason='sold',updated_at=? WHERE order_id=?",(now(),order["id"]))
+            return self.get_order(public_id,c)
     def process_order_line(self,order_id,line_id,sku,listing_id,quantity,payment,fulfillment,raw):
         """Deduplicate an order line and atomically reduce immediately-visible stock."""
         with self.transaction(immediate=True) as c:
@@ -203,4 +286,12 @@ class Database:
             if row and payment=="PAID":
                 remaining=max(0,row["quantity"]-quantity); status="Sold" if remaining==0 else row["status"]
                 c.execute("UPDATE items SET quantity=?,status=?,storefront_visible=?,ebay_sync_state='sold',updated_at=? WHERE id=?",(remaining,status,0 if remaining==0 else row["storefront_visible"],now(),row["id"]))
+                # eBay cannot share this SQLite transaction with Stripe. Preserve
+                # the reservation and durably flag any possibly-authorized sale;
+                # a worker must cancel it outside this transaction.
+                orders=c.execute("SELECT o.* FROM storefront_orders o JOIN item_reservations r ON r.order_id=o.id WHERE o.item_id=? AND r.state='open' AND o.state IN ('authorization_pending','authorized','ebay_withdrawal_pending','capture_pending','paid')",(row["id"],)).fetchall()
+                for order in orders:
+                    target="manual_resolution" if order["state"] in ("capture_pending","paid") else "authorization_cancel_pending"
+                    c.execute("UPDATE storefront_orders SET state=?,conflict_details=?,updated_at=? WHERE id=?",(target,f"eBay order {order_id} line {line_id} owns inventory",now(),order["id"]))
+                    c.execute("INSERT OR IGNORE INTO storefront_operations(order_id,operation_type,state,idempotency_key,created_at,updated_at) VALUES(?, 'stripe_cancel','pending',?,?,?)",(order["id"],f"cancel:{order['public_id']}",now(),now()))
             return True
