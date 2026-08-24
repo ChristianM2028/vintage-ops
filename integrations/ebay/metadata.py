@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 import json
 from .errors import EbayError
 from db import now
+import re
 
 class EbayMetadataService:
     def __init__(self,config,db,client): self.cfg=config; self.db=db; self.client=client
@@ -21,9 +22,11 @@ class EbayMetadataService:
     def suggestions(self,query):
         tree=self.tree()["categoryTreeId"]
         from urllib.parse import quote
-        return self.client.request("GET",f"/commerce/taxonomy/v1/category_tree/{tree}/get_category_suggestions?q={quote(query)}")
+        query=" ".join(str(query).split()).strip()[:100]
+        key=f"suggestions:{self.cfg.marketplace_id}:{tree}:{query.casefold()}"
+        return self._cached(key,lambda:self.client.request("GET",f"/commerce/taxonomy/v1/category_tree/{tree}/get_category_suggestions?q={quote(query)}"))
     def aspects(self,category_id,refresh=False):
-        tree=self.tree()["categoryTreeId"]; key=f"aspects:{tree}:{category_id}"
+        tree=self.tree()["categoryTreeId"]; key=f"aspects:{self.cfg.marketplace_id}:{tree}:{category_id}"
         return self._cached(key,lambda:self.client.request("GET",f"/commerce/taxonomy/v1/category_tree/{tree}/get_item_aspects_for_category?category_id={category_id}"),refresh)
     def conditions(self,category_id,refresh=False):
         key=f"conditions:{self.cfg.marketplace_id}:{category_id}"
