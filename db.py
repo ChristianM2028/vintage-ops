@@ -86,13 +86,16 @@ class Database:
         with self.connect() as con:
             row=con.execute("SELECT * FROM items WHERE sku=? AND storefront_visible=1",(sku,)).fetchone()
             if not row: return None
-            item=self._public_item(row,con)
-            reserved=con.execute("SELECT 1 FROM item_reservations WHERE item_id=? AND state='open' AND expires_at>?",(row["id"],now())).fetchone()
-            item["availability"]="reserved" if reserved else ("available" if row["storefront_visible"] and row["status"]=="Active" and row["quantity"]>0 else "sold" if row["status"]=="Sold" or row["quantity"]<=0 else "unavailable")
-            return item
+            return self._public_storefront_item(row,con)
+    def _public_storefront_item(self, row, con):
+        """Project an item and calculate its availability consistently."""
+        item=self._public_item(row,con)
+        reserved=con.execute("SELECT 1 FROM item_reservations WHERE item_id=? AND state='open' AND expires_at>?",(row["id"],now())).fetchone()
+        item["availability"]="reserved" if reserved else ("available" if row["storefront_visible"] and row["status"]=="Active" and row["quantity"]>0 else "unavailable")
+        return item
     def storefront_catalog(self, search=None, brand=None, size=None, min_price=None, max_price=None, sort="newest"):
         """Query visible, active inventory and return only storefront-safe fields."""
-        clauses=["storefront_visible=1","status='Active'","quantity>0","NOT EXISTS (SELECT 1 FROM item_reservations r WHERE r.item_id=items.id AND r.state='open' AND r.expires_at>?)"]; args=[now()]
+        clauses=["storefront_visible=1","status!='Sold'","quantity>0"]; args=[]
         if search:
             clauses.append("(LOWER(title) LIKE ? OR LOWER(description) LIKE ? OR LOWER(COALESCE(brand,'')) LIKE ?)")
             term=f"%{search.lower()}%"; args.extend((term,term,term))
@@ -104,7 +107,7 @@ class Database:
         if sort not in orders: raise ValueError("Invalid storefront sort")
         with self.connect() as con:
             rows=con.execute("SELECT * FROM items WHERE "+" AND ".join(clauses)+" ORDER BY "+orders[sort],args).fetchall()
-            return [self._public_item(row,con) for row in rows]
+            return [self._public_storefront_item(row,con) for row in rows]
     def inventory(self, status=None):
         with self.connect() as c:
             sql="SELECT * FROM items"; args=[]
