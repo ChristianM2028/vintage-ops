@@ -3,6 +3,9 @@ from dataclasses import replace
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from flask import Flask, abort, flash, jsonify, redirect, render_template, request, send_from_directory, session, url_for
+from functools import wraps
+from urllib.parse import urlsplit
+from werkzeug.security import check_password_hash
 import requests
 from config import Config
 from db import Database, STATUSES
@@ -11,10 +14,11 @@ from integrations.ebay.aspects import parse_aspects, parse_conditions, validate_
 from integrations.ebay.client import EbayClient
 from integrations.ebay.oauth import OAuthManager
 from integrations.ebay.photos import EbayImagePublisher
+from integrations.stripe import StripeAdapter, FakeStripeAdapter, StripeIntegrationError
 
 IMAGE_SIGNATURES={"jpg":lambda b:b.startswith(b"\xff\xd8\xff"),"jpeg":lambda b:b.startswith(b"\xff\xd8\xff"),"png":lambda b:b.startswith(b"\x89PNG\r\n\x1a\n"),"gif":lambda b:b.startswith((b"GIF87a",b"GIF89a")),"webp":lambda b:len(b)>=12 and b[:4]==b"RIFF" and b[8:12]==b"WEBP"}
 
-def create_app(config=None, http=None):
+def create_app(config=None, http=None, stripe_adapter=None):
     cfg=config or Config(); app=Flask(__name__); app.secret_key=cfg.secret_key
     upload_dir=Path(cfg.upload_directory).resolve(); upload_dir.mkdir(parents=True,exist_ok=True)
     class RedactOAuthQuery(logging.Filter):
@@ -23,6 +27,8 @@ def create_app(config=None, http=None):
             return True
     logging.getLogger("werkzeug").addFilter(RedactOAuthQuery())
     db=Database(cfg.database_path); db.migrate(); http_session=http or requests.Session()
+    stripe_gateway=stripe_adapter or (FakeStripeAdapter(cfg) if cfg.stripe_fake_mode else StripeAdapter(cfg))
+    app.config.update(SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE="Lax",SESSION_COOKIE_SECURE=cfg.session_cookie_secure)
     def real_components(overrides=None):
         current=replace(cfg,**(overrides or {})); oauth=OAuthManager(current,db,http_session)
         return oauth,EbayService(current,db,EbayClient(current,oauth,http_session))
@@ -61,7 +67,31 @@ def create_app(config=None, http=None):
     @app.before_request
     def csrf_protect():
         expected=session.get("csrf_token")
-        if request.method=="POST" and (not expected or not secrets.compare_digest(expected, request.form.get("csrf_token", ""))): abort(400,"Invalid CSRF token")
+        if request.method=="POST" and request.endpoint!="stripe_webhook" and (not expected or not secrets.compare_digest(expected, request.form.get("csrf_token", ""))): abort(400,"Invalid CSRF token")
+
+    public_endpoints={"shop","shop_item","media","checkout","order_status","order_success","order_cancel","stripe_webhook","static","login"}
+    @app.before_request
+    def seller_guard():
+        if not cfg.seller_username or not cfg.seller_password_hash: return
+        if request.endpoint in public_endpoints: return
+        if not session.get("seller_authenticated"):
+            return redirect(url_for("login",next=request.full_path if request.method=="GET" else ""))
+
+    @app.route("/login",methods=["GET","POST"])
+    def login():
+        if request.method=="POST":
+            valid_user=secrets.compare_digest(request.form.get("username",""),cfg.seller_username)
+            valid_password=check_password_hash(cfg.seller_password_hash,request.form.get("password","")) if cfg.seller_password_hash else False
+            if valid_user and valid_password:
+                destination=request.form.get("next","")
+                session.clear(); session["seller_authenticated"]=True; session["csrf_token"]=secrets.token_urlsafe(32)
+                if not destination or urlsplit(destination).netloc or not destination.startswith("/"): destination=url_for("home")
+                return redirect(destination)
+            flash("Invalid seller credentials.","error")
+        return render_template("login.html",next=request.args.get("next", ""))
+
+    @app.post("/logout")
+    def logout(): session.clear(); return redirect(url_for("login"))
 
     def category_id(value):
         value=str(value or "").strip()
@@ -183,6 +213,84 @@ def create_app(config=None, http=None):
     def shop_item(sku):
         item=db.get_storefront_item_by_sku(sku) or abort(404)
         return render_template("shop_item.html",item=item)
+    @app.post("/shop/item/<sku>/checkout")
+    def checkout(sku):
+        # The route intentionally consumes no client-controlled commercial data.
+        prior_id=(session.get("checkout_orders") or {}).get(sku)
+        prior=db.get_order(prior_id) if prior_id else None
+        if prior and prior["state"] in ("checkout_pending","authorization_pending") and prior.get("stripe_checkout_session_id"):
+            recovered=stripe_gateway.retrieve_session(prior["stripe_checkout_session_id"])
+            return redirect(recovered["url"] if isinstance(recovered,dict) else recovered.url,code=303)
+        try: order=db.create_storefront_order(sku,cfg.reservation_seconds)
+        except ValueError: abort(409,"This piece is no longer available")
+        checkout_orders=dict(session.get("checkout_orders") or {}); checkout_orders[sku]=order["public_id"]; session["checkout_orders"]=checkout_orders
+        item=db.get_item_by_sku(sku)
+        try:
+            result=stripe_gateway.create_checkout(order,item,cfg.stripe_success_url.replace("{ORDER_ID}",order["public_id"]),cfg.stripe_cancel_url.replace("{ORDER_ID}",order["public_id"]))
+            db.attach_checkout(order["public_id"],result["id"],result.get("payment_intent"))
+            return redirect(result["url"],code=303)
+        except StripeIntegrationError as exc:
+            # Ambiguous creation is retained for recovery; a definite failure is safe to release.
+            if exc.ambiguous: db.transition_order(order["public_id"],"manual_resolution",error=json.dumps(exc.safe_dict()))
+            else: db.release_order(order["public_id"],"cancelled","checkout creation failed")
+            abort(503,"Checkout is temporarily unavailable")
+
+    def process_authorization(order):
+        if order["state"] in ("sold","cancelled","manual_resolution"): return order
+        if order["state"] in ("checkout_pending","authorization_pending"):
+            order=db.transition_order(order["public_id"],"authorized",payment_state="authorized")
+        item=db.get_item(order["item_id"])
+        if item["status"]=="Sold" or item["quantity"]<1:
+            db.transition_order(order["public_id"],"authorization_cancel_pending",conflict="eBay/local inventory sold first")
+            try:
+                stripe_gateway.cancel(order["stripe_payment_intent_id"],f"cancel:{order['public_id']}")
+                return db.release_order(order["public_id"],"unavailable","inventory sold elsewhere")
+            except StripeIntegrationError as exc: return db.transition_order(order["public_id"],"manual_resolution",error=json.dumps(exc.safe_dict()))
+        if order["state"]=="authorized": order=db.transition_order(order["public_id"],"ebay_withdrawal_pending")
+        try:
+            if item.get("ebay_publication_state")=="published": resolve_ebay(item)[0].delist(item)
+            order=db.transition_order(order["public_id"],"capture_pending")
+        except EbayError as exc:
+            db.transition_order(order["public_id"],"authorization_cancel_pending",error=json.dumps(exc.safe_dict()))
+            try:
+                stripe_gateway.cancel(order["stripe_payment_intent_id"],f"cancel:{order['public_id']}")
+                return db.release_order(order["public_id"],"cancelled","eBay withdrawal failed")
+            except StripeIntegrationError as cancel_error: return db.transition_order(order["public_id"],"manual_resolution",error=json.dumps(cancel_error.safe_dict()))
+        try:
+            stripe_gateway.capture(order["stripe_payment_intent_id"],f"capture:{order['public_id']}")
+            db.transition_order(order["public_id"],"paid",payment_state="captured")
+            return db.finalize_storefront_sale(order["public_id"])
+        except StripeIntegrationError as exc:
+            return db.transition_order(order["public_id"],"manual_resolution",error=json.dumps(exc.safe_dict()))
+
+    @app.post("/stripe/webhook")
+    def stripe_webhook():
+        payload=request.get_data(cache=False)
+        try: event=stripe_gateway.verify_webhook(payload,request.headers.get("Stripe-Signature"))
+        except StripeIntegrationError: abort(400,"Invalid signature")
+        event_id=str(event.get("id", "")); event_type=str(event.get("type", ""))
+        if not event_id or not db.claim_webhook(event_id,event_type): return "",200
+        try:
+            obj=(event.get("data") or {}).get("object") or {}; sid=obj.get("id") if event_type.startswith("checkout.session") else obj.get("checkout_session"); pi=obj.get("payment_intent") or (obj.get("id") if event_type.startswith("payment_intent") else None)
+            order=db.find_order_by_stripe(sid,pi)
+            if order and event_type in ("checkout.session.completed","checkout.session.async_payment_succeeded","payment_intent.amount_capturable_updated"):
+                process_authorization(order)
+            elif order and event_type in ("checkout.session.expired","checkout.session.async_payment_failed","payment_intent.canceled") and order["state"] in ("checkout_pending","authorization_pending"):
+                db.release_order(order["public_id"],"expired" if event_type=="checkout.session.expired" else "cancelled",event_type)
+            db.finish_webhook(event_id); return "",200
+        except Exception as exc:
+            app.logger.warning("Stripe event processing failed: %s",type(exc).__name__); db.finish_webhook(event_id,"Processing failed"); return "",500
+
+    @app.get("/shop/order/<public_id>")
+    def order_status(public_id): return render_template("order_status.html",order=db.get_order(public_id) or abort(404))
+    @app.get("/shop/order/<public_id>/success")
+    def order_success(public_id): return render_template("order_status.html",order=db.get_order(public_id) or abort(404),redirect_kind="success")
+    @app.get("/shop/order/<public_id>/cancel")
+    def order_cancel(public_id): return render_template("order_status.html",order=db.get_order(public_id) or abort(404),redirect_kind="cancel")
+
+    @app.post("/maintenance/storefront")
+    def storefront_maintenance():
+        count=db.expire_reservations(100); flash(f"Expired {count} stale reservation(s).","success"); return redirect(url_for("inventory"))
     @app.post("/items/<int:item_id>/storefront-visibility")
     def storefront_visibility(item_id):
         item_or_404(item_id)
@@ -363,7 +471,7 @@ def create_app(config=None, http=None):
         except EbayError as error:
             flash(json.dumps(error.safe_dict()),"error")
         return redirect(url_for("sandbox"))
-    app.extensions.update(vintage_db=db,ebay_components=real_components,ebay_metadata=metadata_component(),ebay_metadata_factory=metadata_component,marketplace_adapters=adapters)
+    app.extensions.update(vintage_db=db,stripe_adapter=stripe_gateway,ebay_components=real_components,ebay_metadata=metadata_component(),ebay_metadata_factory=metadata_component,marketplace_adapters=adapters)
     return app
 
 if __name__ == "__main__":

@@ -92,3 +92,50 @@ The integration follows the official eBay REST resources: Taxonomy category tree
 ### Order-state policy
 
 Fulfillment reconciliation records every `(orderId, lineItemId)` once. A `PAID` line decrements quantity atomically and hides zero-stock items immediately. Pending/failed payment is recorded but does not reserve or decrement local stock. Cancellation and refund data is retained for audit and synchronization, but Vintage Ops does not automatically relist or increase stock because return disposition may be unknown; the seller reviews and edits inventory explicitly. Multi-quantity paid lines decrement by the reported quantity, and unknown SKUs/listing IDs are retained and counted for manual resolution.
+# Two-channel purchase operations
+
+The local `items` row remains canonical inventory. Website checkout first acquires
+an expiring SQLite reservation in a short `BEGIN IMMEDIATE` transaction, then
+creates Stripe Checkout only after commit. Checkout uses manual capture: the
+state progression is `checkout_pending` → `authorization_pending` → `authorized`
+→ `ebay_withdrawal_pending` → `capture_pending` → `paid` → `sold`. Cancellation,
+expiry, unavailability, and `manual_resolution` are explicit terminal/review
+paths. Remote Stripe and eBay calls are never made while a database transaction
+is open, and stable order-derived idempotency keys protect create, capture, and
+cancel operations.
+
+Reservations are normally valid for `STOREFRONT_RESERVATION_SECONDS`. Schedule a
+bounded POST to `/maintenance/storefront` (authenticated and CSRF protected) and
+durable operation retries. A failed, confirmed checkout creation may release
+stock; an ambiguous withdrawal, capture, or cancellation must retain stock and
+be reviewed rather than optimistically reopening it. Stripe webhooks must be
+registered at `/stripe/webhook`; their raw bodies are signature verified and
+event IDs are atomically deduplicated.
+
+## Configuration and local testing
+
+Generate `SELLER_PASSWORD_HASH` with Werkzeug's `generate_password_hash`; never
+store a plaintext password. Set `SELLER_USERNAME`, a strong `FLASK_SECRET_KEY`,
+and enable `SESSION_COOKIE_SECURE` behind HTTPS. Set `STRIPE_FAKE_MODE=true` for
+network-free development. Production uses `STRIPE_SECRET_KEY`,
+`STRIPE_WEBHOOK_SECRET`, HTTPS success/cancel URLs, plus the existing eBay
+credentials. Browser submissions never determine amount, currency, quantity,
+status, or provider identifiers; those values come from the canonical item and
+immutable order snapshots.
+
+## Production checklist and conflict boundary
+
+SQLite serializes local ownership decisions, but neither Stripe nor eBay can
+participate in that transaction. Simultaneous external sales therefore cannot be
+eliminated completely. Paid eBay reconciliation atomically hides/decrements the
+item, records a website conflict, and durably schedules authorization
+cancellation; an already possibly captured website payment enters prominent
+manual resolution.
+
+Production operation requires HTTPS, secure cookies, a reverse proxy and
+production WSGI server, registered Stripe webhooks, real restricted Stripe/eBay
+credentials, backups, monitoring/alerting, durable scheduled retries and
+reservation cleanup, and documented staff procedures for every manual-resolution
+case. Review cancellation, capture failure, eBay withdrawal failure, expiry,
+retry, and cross-channel conflict queues routinely; a redirect success page is
+never evidence of payment.
