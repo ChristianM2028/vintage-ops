@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from config import Config
 from db import Database
 from integrations.ebay.mock import MockEbayAdapter
+from werkzeug.security import generate_password_hash
 
 
 def values(title="Jacket"):
@@ -98,3 +99,44 @@ def test_storefront_validation_sorting_and_visibility_csrf(tmp_path):
     changed=client.post(f"/items/{high['id']}/storefront-visibility",data={"csrf_token":token,"storefront_visible":"0"})
     assert changed.status_code==302 and changed.headers["Location"].endswith(f"/items/{high['id']}")
     assert db.get_item(high["id"])["storefront_visible"]==0
+
+
+def test_seller_navigation_and_post_only_logout(tmp_path):
+    from app import create_app
+    cfg=Config(
+        database_path=str(tmp_path/"auth.sqlite"),
+        upload_directory=str(tmp_path/"uploads"),
+        seller_username="seller",
+        seller_password_hash=generate_password_hash("correct horse battery staple"),
+    )
+    app=create_app(cfg); app.testing=True; client=app.test_client()
+
+    storefront=client.get("/shop")
+    assert b'href="/login"' in storefront.data and b"Admin sign in" in storefront.data
+    assert b"Admin dashboard" not in storefront.data
+
+    login=client.get("/login")
+    token=login.text.split('name="csrf_token" value="',1)[1].split('"',1)[0]
+    signed_in=client.post("/login",data={
+        "csrf_token":token,
+        "username":"seller",
+        "password":"correct horse battery staple",
+    })
+    assert signed_in.status_code==302 and signed_in.headers["Location"].endswith("/")
+
+    authenticated_storefront=client.get("/shop")
+    assert b'href="/"' in authenticated_storefront.data and b"Admin dashboard" in authenticated_storefront.data
+    assert b"Admin sign in" not in authenticated_storefront.data
+
+    admin=client.get("/")
+    assert b'href="/shop"' in admin.data and b"View storefront" in admin.data
+    assert b'method="post" action="/logout"' in admin.data and b"Log out" in admin.data
+    logout_token=admin.text.split('action="/logout"',1)[1].split('name="csrf_token" value="',1)[1].split('"',1)[0]
+
+    assert client.get("/logout").status_code==405
+    assert client.post("/logout").status_code==400
+    logged_out=client.post("/logout",data={"csrf_token":logout_token})
+    assert logged_out.status_code==302 and logged_out.headers["Location"].endswith("/login")
+    with client.session_transaction() as session:
+        assert "seller_authenticated" not in session
+    assert client.get("/").headers["Location"].startswith("/login?")
