@@ -7,7 +7,11 @@ class FakeStripeAdapter:
         self.calls.append({"order":order["public_id"],"amount":order["price_snapshot"],"currency":order["currency_snapshot"],"quantity":1,"name":item["title"]})
         sid="cs_test_"+order["public_id"][:16]; pi="pi_test_"+order["public_id"][:16]
         result={"id":sid,"payment_intent":pi,"url":f"/shop/order/{order['public_id']}"}; self.sessions[sid]=result; return result
-    def retrieve_session(self,session_id): return self.sessions[session_id]
+    def retrieve_session(self,session_id):
+        session=self.sessions.get(session_id)
+        if session is None:
+            raise StripeIntegrationError("session_not_found","Checkout session was not found",ambiguous=False)
+        return session
     def capture(self,payment_intent_id,key):
         if key not in [x[1] for x in self.captures]: self.captures.append((payment_intent_id,key))
         return {"id":payment_intent_id,"status":"succeeded"}

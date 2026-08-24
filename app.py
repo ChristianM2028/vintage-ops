@@ -219,6 +219,8 @@ def create_app(config=None, http=None, stripe_adapter=None):
         prior_id=(session.get("checkout_orders") or {}).get(sku)
         prior=db.get_order(prior_id) if prior_id else None
         if prior and prior["state"] in ("checkout_pending","authorization_pending") and prior.get("stripe_checkout_session_id"):
+            if cfg.stripe_fake_mode:
+                return redirect(url_for("order_status",public_id=prior["public_id"]),code=303)
             recovered=stripe_gateway.retrieve_session(prior["stripe_checkout_session_id"])
             return redirect(recovered["url"] if isinstance(recovered,dict) else recovered.url,code=303)
         try: order=db.create_storefront_order(sku,cfg.reservation_seconds)
