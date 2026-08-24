@@ -50,8 +50,8 @@ class Database:
         finally: con.close()
     def create_item(self, photos=None, **v):
         """Atomically allocate the next human-readable SKU and insert photo metadata."""
-        stamp=now(); fields=("title","description","price","currency","quantity","condition","brand","size","color","category","photo_urls")
-        vals=[json.dumps(v.get(k, [])) if k=="photo_urls" else v.get(k) for k in fields]
+        stamp=now(); fields=("title","description","price","currency","quantity","condition","brand","size","color","category","category_name","photo_urls","item_specifics")
+        vals=[json.dumps(v.get(k, [] if k=="photo_urls" else {})) if k in ("photo_urls","item_specifics") else v.get(k) for k in fields]
         with self.transaction(immediate=True) as c:
             # Explicit SKUs remain accepted for the isolated legacy Sandbox test
             # harness; the seller workflow never accepts or sends one.
@@ -74,7 +74,7 @@ class Database:
     @staticmethod
     def _public_item(row, con):
         """Return the deliberately small, ID-free representation used by the shop."""
-        item={key: row[key] for key in ("sku","title","description","price","currency","quantity","condition","brand","size","color","category","status","created_at")}
+        item={key: row[key] for key in ("sku","title","description","price","currency","quantity","condition","brand","size","color","category","category_name","status","created_at")}
         item["photos"]=[{"filename": p["filename"], "original_filename": p["original_filename"]} for p in con.execute("SELECT filename,original_filename FROM item_photos WHERE item_id=? ORDER BY display_order,id",(row["id"],))]
         return item
     def get_storefront_item_by_sku(self, sku):
@@ -105,7 +105,7 @@ class Database:
             return [self.get_item(r["id"],c) for r in rows]
     def get_photos(self,item_id): return (self.get_item(item_id) or {}).get("photos",[])
     def update_item(self,item_id,**values):
-        allowed={"title","description","price","currency","quantity","condition","brand","size","color","category","photo_urls","item_specifics","ebay_sku","ebay_offer_id","ebay_listing_id","ebay_publication_state","ebay_sync_state","local_revision","synced_revision","publication_lock_token","publication_lock_expires_at","last_error","status","storefront_visible"}
+        allowed={"title","description","price","currency","quantity","condition","brand","size","color","category","category_name","photo_urls","item_specifics","ebay_sku","ebay_offer_id","ebay_listing_id","ebay_publication_state","ebay_sync_state","local_revision","synced_revision","publication_lock_token","publication_lock_expires_at","last_error","status","storefront_visible"}
         if not values: return self.get_item(item_id)
         if set(values)-allowed: raise ValueError("Unsupported item field")
         for key in ("photo_urls","item_specifics"):
@@ -126,7 +126,7 @@ class Database:
         with self.transaction() as c: c.execute("UPDATE item_photos SET remote_url=?,source_fingerprint=?,publication_error=?,updated_at=? WHERE id=?",(url,fingerprint,error,now(),photo_id))
     def update_item_and_photos(self,item_id,values,photos=None):
         """Atomically accept canonical edits and optional replacement photo rows."""
-        allowed={"title","description","price","quantity","condition","category","brand","size","color","item_specifics"}
+        allowed={"title","description","price","quantity","condition","category","category_name","brand","size","color","item_specifics"}
         if set(values)-allowed: raise ValueError("Unsupported editable item field")
         stamp=now(); values=dict(values); values["item_specifics"]=json.dumps(values.get("item_specifics",{}))
         with self.transaction(immediate=True) as c:

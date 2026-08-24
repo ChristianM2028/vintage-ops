@@ -13,8 +13,9 @@ class EbayService:
     def _inventory(self,item):
         photos=json.loads(item["photo_urls"]) if isinstance(item["photo_urls"],str) else item["photo_urls"]
         aspects=dict(item.get("item_specifics") or {})
+        existing={k.casefold() for k in aspects}
         for k in ("brand","size","color"):
-            if item.get(k) and k not in aspects: aspects[k]=[item[k]]
+            if item.get(k) and k.casefold() not in existing: aspects[k.title()]=[item[k]]
         aspects={k:v if isinstance(v,list) else [v] for k,v in aspects.items() if v not in (None,"",[])}
         return {"availability":{"shipToLocationAvailability":{"quantity":item["quantity"]}},"condition":item["condition"],"product":{"title":item["title"],"description":item["description"],"imageUrls":photos,"aspects":aspects}}
     def _offer(self,item):

@@ -2,11 +2,12 @@ import json, logging, os, re, secrets
 from dataclasses import replace
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from flask import Flask, abort, flash, redirect, render_template, request, send_from_directory, session, url_for
+from flask import Flask, abort, flash, jsonify, redirect, render_template, request, send_from_directory, session, url_for
 import requests
 from config import Config
 from db import Database, STATUSES
-from integrations.ebay import EbayService, MockEbayAdapter, EbayError, SandboxSellerSetup
+from integrations.ebay import EbayService, MockEbayAdapter, EbayError, SandboxSellerSetup, EbayMetadataService
+from integrations.ebay.aspects import parse_aspects, parse_conditions, validate_specifics
 from integrations.ebay.client import EbayClient
 from integrations.ebay.oauth import OAuthManager
 from integrations.ebay.photos import PhotoPublisher
@@ -25,6 +26,9 @@ def create_app(config=None, http=None):
     def real_components(overrides=None):
         current=replace(cfg,**(overrides or {})); oauth=OAuthManager(current,db,http_session)
         return oauth,EbayService(current,db,EbayClient(current,oauth,http_session))
+    def metadata_component(overrides=None):
+        current=replace(cfg,**(overrides or {})); oauth=OAuthManager(current,db,http_session)
+        return EbayMetadataService(current,db,EbayClient(current,oauth,http_session))
     def adapters():
         return {"ebay": MockEbayAdapter(cfg,db) if cfg.marketplace_mock_mode else real_components()[1]}
     def item_or_404(item_id): return db.get_item(item_id) or abort(404)
@@ -36,6 +40,55 @@ def create_app(config=None, http=None):
     def csrf_protect():
         expected=session.get("csrf_token")
         if request.method=="POST" and (not expected or not secrets.compare_digest(expected, request.form.get("csrf_token", ""))): abort(400,"Invalid CSRF token")
+
+    def category_id(value):
+        value=str(value or "").strip()
+        if not re.fullmatch(r"[0-9]{1,20}",value): abort(400,"Invalid category ID")
+        return value
+    def metadata_for(category):
+        category=category_id(category)
+        return parse_aspects(metadata_component().aspects(category)),parse_conditions(metadata_component().conditions(category))
+    def submitted_specifics():
+        result={}
+        for key in request.form:
+            if key.startswith("aspect.") and key[7:]: result[key[7:]]=request.form.getlist(key)
+        return result
+    def validate_metadata_form(values):
+        errors=[]
+        category=values.get("category","").strip(); name=values.get("category_name","").strip()
+        # Local mock mode has no taxonomy API. Retain its deliberately isolated
+        # legacy fixtures; real seller workflows always require a suggestion.
+        if cfg.marketplace_mock_mode and category and not name:
+            values["category_name"]=category
+            return {},[],[],[]
+        if not category or not name: return {},[],[],["Select a category from the suggestions."]
+        try: fields,conditions=metadata_for(category)
+        except EbayError: return {},[],[],["Category metadata is temporarily unavailable; your entries were preserved."]
+        specifics,specific_errors=validate_specifics(fields,submitted_specifics()); errors.extend(specific_errors)
+        allowed={x["value"] for x in conditions}
+        if values.get("condition") not in allowed: errors.append("Choose a condition available for the selected category.")
+        selected=next((x for x in conditions if x["value"]==values.get("condition")),None)
+        if selected and selected["requires_descriptors"]: errors.append("This condition requires supplementary descriptors that this form does not yet support; choose another condition.")
+        # Canonical garment fields mirror their exact eBay-named controls.
+        for local in ("brand","size","color"):
+            match=next((f["name"] for f in fields if f["name"].casefold()==local),None)
+            if match and specifics.get(match): values[local]=specifics[match][0]
+        return specifics,fields,conditions,errors
+
+    @app.get("/ebay/metadata/category-suggestions")
+    def category_suggestions():
+        query=" ".join(request.args.get("q","").split()).strip()[:100]
+        if len(query)<2: return jsonify({"suggestions":[]})
+        data=metadata_component().suggestions(query); safe=[]
+        for entry in data.get("categorySuggestions",[])[:20]:
+            cat=entry.get("category") or {}; cid=str(cat.get("categoryId", ""))
+            if re.fullmatch(r"[0-9]{1,20}",cid) and cat.get("categoryName"):
+                safe.append({"id":cid,"name":str(cat["categoryName"])[:200]})
+        return jsonify({"suggestions":safe})
+    @app.get("/ebay/metadata/categories/<category>/aspects")
+    def category_aspects(category): return jsonify({"aspects":parse_aspects(metadata_component().aspects(category_id(category)))})
+    @app.get("/ebay/metadata/categories/<category>/conditions")
+    def category_conditions(category): return jsonify({"conditions":parse_conditions(metadata_component().conditions(category_id(category)))})
 
     @app.route("/",methods=["GET","POST"])
     def home():
@@ -49,6 +102,7 @@ def create_app(config=None, http=None):
                 if price <= 0 or price.as_tuple().exponent < -2: raise InvalidOperation
                 values["price"]=f"{price:.2f}"
             except (InvalidOperation,ValueError): errors.append("Price must be a positive amount with at most two decimal places.")
+            specifics,aspect_fields,conditions,metadata_errors=validate_metadata_form(values); errors.extend(metadata_errors)
             files=[f for f in request.files.getlist("photos") if f and f.filename]
             if not files: errors.append("Add at least one photo.")
             if len(files)>cfg.max_photo_count: errors.append(f"You may upload at most {cfg.max_photo_count} photos.")
@@ -63,13 +117,13 @@ def create_app(config=None, http=None):
                 try:
                     for name,_,data in prepared: (upload_dir/name).write_bytes(data); saved.append(upload_dir/name)
                     photo_urls=[url_for("media",filename=name,_external=True) for name,_,_ in prepared]
-                    item=db.create_item(title=values["title"].strip(),description=values["description"].strip(),price=values["price"],currency=cfg.currency,quantity=1,condition=values["condition"].strip(),brand=values.get("brand","").strip(),size=values.get("size","").strip(),color=values.get("color","").strip(),category=values["category"].strip(),photo_urls=photo_urls,photos=[{"filename":n,"original_filename":o} for n,o,_ in prepared])
+                    item=db.create_item(title=values["title"].strip(),description=values["description"].strip(),price=values["price"],currency=cfg.currency,quantity=1,condition=values["condition"].strip(),brand=values.get("brand","").strip(),size=values.get("size","").strip(),color=values.get("color","").strip(),category=values["category"].strip(),category_name=values["category_name"].strip(),item_specifics=specifics,photo_urls=photo_urls,photos=[{"filename":n,"original_filename":o} for n,o,_ in prepared])
                     flash(f"Created {item['sku']}","success"); return redirect(url_for("item_page",item_id=item["id"]))
                 except Exception:
                     for path in saved: path.unlink(missing_ok=True)
                     errors.append("The item could not be saved. Uploaded files were cleaned up.")
             for error in errors: flash(error,"error")
-        return render_template("create_item.html",values=values,max_photos=cfg.max_photo_count,extensions=cfg.permitted_image_extensions)
+        return render_template("create_item.html",values=values,max_photos=cfg.max_photo_count,extensions=cfg.permitted_image_extensions,submitted_specifics=submitted_specifics())
 
     @app.get("/media/<path:filename>")
     def media(filename):
@@ -79,7 +133,11 @@ def create_app(config=None, http=None):
     def inventory():
         status=request.args.get("status"); return render_template("inventory.html",items=db.inventory(status),statuses=STATUSES,selected=status)
     @app.get("/items/<int:item_id>")
-    def item_page(item_id): return render_template("item.html",item=item_or_404(item_id),mock_mode=cfg.marketplace_mock_mode)
+    def item_page(item_id):
+        item=item_or_404(item_id); missing=[]
+        try: missing=(json.loads(item.get("last_error") or "{}").get("missing_aspects") or [])
+        except (ValueError,TypeError): pass
+        return render_template("item.html",item=item,mock_mode=cfg.marketplace_mock_mode,missing_aspects=missing)
     @app.get("/shop")
     def shop():
         allowed={"q","brand","size","min_price","max_price","sort"}
@@ -138,10 +196,7 @@ def create_app(config=None, http=None):
                 price=Decimal(request.form.get("price","")); quantity=int(request.form.get("quantity",""))
                 if price<=0 or price.as_tuple().exponent < -2 or quantity<0: raise ValueError
             except (ValueError,InvalidOperation): errors.append("Price and quantity must be valid non-negative values.")
-            try:
-                specifics=json.loads(request.form.get("item_specifics","{}"))
-                if not isinstance(specifics,dict): raise ValueError
-            except (ValueError,json.JSONDecodeError): errors.append("Item specifics must be a JSON object."); specifics={}
+            specifics,aspect_fields,conditions,metadata_errors=validate_metadata_form(values); errors.extend(metadata_errors)
             replacement=[]; saved=[]
             files=[f for f in request.files.getlist("photos") if f and f.filename]
             if len(files)>cfg.max_photo_count: errors.append(f"You may upload at most {cfg.max_photo_count} photos.")
@@ -153,13 +208,13 @@ def create_app(config=None, http=None):
             if not errors:
                 try:
                     for p in replacement: (upload_dir/p["filename"]).write_bytes(p.pop("data")); saved.append(upload_dir/p["filename"])
-                    db.update_item_and_photos(item_id,{"title":request.form["title"].strip(),"description":request.form["description"].strip(),"price":f"{price:.2f}","quantity":quantity,"condition":request.form["condition"].strip(),"category":request.form["category"].strip(),"brand":request.form.get("brand","").strip(),"size":request.form.get("size","").strip(),"color":request.form.get("color","").strip(),"item_specifics":specifics},replacement or None)
+                    db.update_item_and_photos(item_id,{"title":request.form["title"].strip(),"description":request.form["description"].strip(),"price":f"{price:.2f}","quantity":quantity,"condition":request.form["condition"].strip(),"category":request.form["category"].strip(),"category_name":request.form["category_name"].strip(),"brand":values.get("brand","").strip(),"size":values.get("size","").strip(),"color":values.get("color","").strip(),"item_specifics":specifics},replacement or None)
                     flash("Edits saved. Synchronize to apply them to eBay.","success"); return redirect(url_for("item_page",item_id=item_id))
                 except Exception:
                     for path in saved: path.unlink(missing_ok=True)
                     errors.append("The edit could not be saved; replacement uploads were cleaned up.")
             for error in errors: flash(error,"error")
-        return render_template("edit_item.html",item=item,values=values,specifics=json.dumps(item.get("item_specifics",{}),indent=2))
+        return render_template("edit_item.html",item=item,values=values,submitted_specifics=submitted_specifics() if request.method=="POST" else item.get("item_specifics",{}))
     @app.post("/items/<int:item_id>/list-everywhere")
     def list_everywhere(item_id):
         # The registry intentionally contains implemented adapters only.
@@ -220,18 +275,22 @@ def create_app(config=None, http=None):
         try: oauth.access_token(); authenticated=True
         except EbayError: pass
         if request.method=="POST":
-            item=db.create_item(title=request.form["title"],description=request.form["description"],price=request.form["price"],currency=cfg.currency,quantity=1,condition=request.form["condition"],brand=request.form["brand"],size=request.form["size"],color=request.form["color"],category=request.form["category"],photo_urls=[request.form["photo_url"]])
             setup=db.get_seller_setup()
             if not setup:
                 flash("Set up the Sandbox seller before listing an item.","error")
-                return redirect(url_for("sandbox"))
+                return render_template("sandbox.html",cfg=cfg,authenticated=authenticated,setup=None,values=request.form.to_dict(),submitted_specifics=submitted_specifics())
+            values=request.form.to_dict(); specifics,_,_,errors=validate_metadata_form(values)
+            if errors:
+                for error in errors: flash(error,"error")
+                return render_template("sandbox.html",cfg=cfg,authenticated=authenticated,setup=setup,values=values,submitted_specifics=submitted_specifics())
+            item=db.create_item(title=request.form["title"],description=request.form["description"],price=request.form["price"],currency=cfg.currency,quantity=1,condition=request.form["condition"],brand=values.get("brand","").strip(),size=values.get("size","").strip(),color=values.get("color","").strip(),category=request.form["category"],category_name=request.form["category_name"],item_specifics=specifics,photo_urls=[request.form["photo_url"]])
             overrides={"location_key":setup["merchant_location_key"], "fulfillment_policy_id":setup["fulfillment_policy_id"],
                        "payment_policy_id":setup["payment_policy_id"], "return_policy_id":setup["return_policy_id"],
                        "marketplace_id":setup["marketplace"]}
             try: real_components(overrides)[1].list(item); flash("Fake item published to eBay Sandbox","success")
             except EbayError as e: flash(json.dumps(e.safe_dict()),"error")
             return redirect(url_for("item_page",item_id=item["id"]))
-        return render_template("sandbox.html",cfg=cfg,authenticated=authenticated,setup=db.get_seller_setup())
+        return render_template("sandbox.html",cfg=cfg,authenticated=authenticated,setup=db.get_seller_setup(),values={},submitted_specifics={})
     @app.post("/sandbox/setup")
     def sandbox_setup():
         if cfg.environment != "sandbox": abort(404)
@@ -243,7 +302,7 @@ def create_app(config=None, http=None):
         except EbayError as error:
             flash(json.dumps(error.safe_dict()),"error")
         return redirect(url_for("sandbox"))
-    app.extensions.update(vintage_db=db,ebay_components=real_components,marketplace_adapters=adapters)
+    app.extensions.update(vintage_db=db,ebay_components=real_components,ebay_metadata=metadata_component(),ebay_metadata_factory=metadata_component,marketplace_adapters=adapters)
     return app
 
 if __name__ == "__main__":
