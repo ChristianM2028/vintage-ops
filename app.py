@@ -29,6 +29,27 @@ def create_app(config=None, http=None):
     def metadata_component(overrides=None):
         current=replace(cfg,**(overrides or {})); oauth=OAuthManager(current,db,http_session)
         return EbayMetadataService(current,db,EbayClient(current,oauth,http_session))
+    SNAPSHOT_FIELDS={"location_key":"ebay_merchant_location_key","fulfillment_policy_id":"ebay_fulfillment_policy_id",
+                     "payment_policy_id":"ebay_payment_policy_id","return_policy_id":"ebay_return_policy_id",
+                     "marketplace_id":"ebay_marketplace_id"}
+    def resolve_ebay(item, establish=False):
+        """Resolve from persisted item state, classifying an unlisted item once."""
+        mode=item.get("ebay_integration_mode")
+        if not mode and establish:
+            associated=any(item.get(k) for k in ("ebay_sku","ebay_offer_id","ebay_listing_id","ebay_publication_state"))
+            if associated: raise EbayError("classification_required","This legacy published item needs an explicit eBay integration mode")
+            mode="local_mock" if cfg.marketplace_mock_mode else ("ebay_sandbox" if cfg.environment=="sandbox" else "ebay_production")
+            values={"ebay_integration_mode":mode}
+            if mode!="local_mock": values.update({column:getattr(cfg,key) for key,column in SNAPSHOT_FIELDS.items()})
+            item=db.update_item(item["id"],**values)
+        if mode=="local_mock": return MockEbayAdapter(cfg,db),item
+        if mode in ("ebay_sandbox","ebay_production"):
+            if any(not item.get(column) for column in SNAPSHOT_FIELDS.values()):
+                raise EbayError("classification_required","This item is missing its persisted eBay seller configuration")
+            overrides={key:item[column] for key,column in SNAPSHOT_FIELDS.items()}
+            overrides["environment"]="sandbox" if mode=="ebay_sandbox" else "production"
+            return real_components(overrides)[1],item
+        raise EbayError("classification_required","Choose an eBay integration mode before operating on this item")
     def adapters():
         return {"ebay": MockEbayAdapter(cfg,db) if cfg.marketplace_mock_mode else real_components()[1]}
     def item_or_404(item_id): return db.get_item(item_id) or abort(404)
@@ -137,7 +158,7 @@ def create_app(config=None, http=None):
         item=item_or_404(item_id); missing=[]
         try: missing=(json.loads(item.get("last_error") or "{}").get("missing_aspects") or [])
         except (ValueError,TypeError): pass
-        return render_template("item.html",item=item,mock_mode=cfg.marketplace_mock_mode,missing_aspects=missing)
+        return render_template("item.html",item=item,missing_aspects=missing)
     @app.get("/shop")
     def shop():
         allowed={"q","brand","size","min_price","max_price","sort"}
@@ -172,9 +193,10 @@ def create_app(config=None, http=None):
     def run_action(item_id, operation, success):
         item=item_or_404(item_id)
         try:
-            if operation in ("list","update") and not cfg.marketplace_mock_mode and item.get("photos"):
-                PhotoPublisher(cfg,db,http_session).publish(item); item=db.get_item(item_id)
-            item=getattr(adapters()["ebay"],operation)(item); flash(success,"success")
+            adapter,item=resolve_ebay(item,establish=operation=="list")
+            if operation in ("list","update") and item.get("ebay_integration_mode")!="local_mock" and item.get("photos"):
+                PhotoPublisher(adapter.cfg,db,http_session).publish(item); item=db.get_item(item_id)
+            item=getattr(adapter,operation)(item); flash(success,"success")
         except EbayError as e: db.update_item(item_id,last_error=json.dumps(e.safe_dict())); flash(str(e),"error")
         return redirect(url_for("item_page",item_id=item_id))
     @app.post("/items/<int:item_id>/list-ebay")
@@ -220,9 +242,10 @@ def create_app(config=None, http=None):
         # The registry intentionally contains implemented adapters only.
         item=item_or_404(item_id)
         try:
-            for adapter in adapters().values():
-                if adapter.name=="ebay" and not cfg.marketplace_mock_mode and item.get("photos"):
-                    PhotoPublisher(cfg,db,http_session).publish(item); item=db.get_item(item_id)
+            adapter,item=resolve_ebay(item,establish=True)
+            for adapter in (adapter,):
+                if item.get("ebay_integration_mode")!="local_mock" and item.get("photos"):
+                    PhotoPublisher(adapter.cfg,db,http_session).publish(item); item=db.get_item(item_id)
                 item=adapter.list(item)
             flash("Listed on every configured marketplace (eBay).","success")
         except EbayError as e: db.update_item(item_id,last_error=json.dumps(e.safe_dict())); flash("Not all marketplaces were listed: "+str(e),"error")
@@ -230,7 +253,11 @@ def create_app(config=None, http=None):
     @app.post("/items/<int:item_id>/sold-delist-everywhere")
     def sold_everywhere(item_id):
         item=item_or_404(item_id); failures=[]
-        for adapter in adapters().values():
+        try: adapter,item=resolve_ebay(item)
+        except EbayError as e:
+            db.update_item(item_id,last_error=json.dumps(e.safe_dict())); flash(str(e),"error")
+            return redirect(url_for("item_page",item_id=item_id))
+        for adapter in (adapter,):
             if item.get("ebay_publication_state")=="published":
                 try: item=adapter.delist(item)
                 except EbayError as e: failures.append({"marketplace":adapter.name,"error":e.safe_dict()})
@@ -283,10 +310,10 @@ def create_app(config=None, http=None):
             if errors:
                 for error in errors: flash(error,"error")
                 return render_template("sandbox.html",cfg=cfg,authenticated=authenticated,setup=setup,values=values,submitted_specifics=submitted_specifics())
-            item=db.create_item(title=request.form["title"],description=request.form["description"],price=request.form["price"],currency=cfg.currency,quantity=1,condition=request.form["condition"],brand=values.get("brand","").strip(),size=values.get("size","").strip(),color=values.get("color","").strip(),category=request.form["category"],category_name=request.form["category_name"],item_specifics=specifics,photo_urls=[request.form["photo_url"]])
             overrides={"location_key":setup["merchant_location_key"], "fulfillment_policy_id":setup["fulfillment_policy_id"],
                        "payment_policy_id":setup["payment_policy_id"], "return_policy_id":setup["return_policy_id"],
                        "marketplace_id":setup["marketplace"]}
+            item=db.create_item(title=request.form["title"],description=request.form["description"],price=request.form["price"],currency=cfg.currency,quantity=1,condition=request.form["condition"],brand=values.get("brand","").strip(),size=values.get("size","").strip(),color=values.get("color","").strip(),category=request.form["category"],category_name=request.form["category_name"],item_specifics=specifics,photo_urls=[request.form["photo_url"]],ebay_integration_mode="ebay_sandbox",**{SNAPSHOT_FIELDS[k]:v for k,v in overrides.items()})
             try: real_components(overrides)[1].list(item); flash("Fake item published to eBay Sandbox","success")
             except EbayError as e: flash(json.dumps(e.safe_dict()),"error")
             return redirect(url_for("item_page",item_id=item["id"]))
