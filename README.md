@@ -9,7 +9,6 @@ Prerequisites: Python 3.11+ and an eBay Developers Program Sandbox account.
 ```sh
 cp .env.example .env
 make setup
-set -a; . ./.env; set +a
 make migrate
 make run
 ```
@@ -25,7 +24,7 @@ python -c 'import secrets; print(secrets.token_urlsafe(48))'
 .venv/bin/python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
 ```
 
-Put those values in `FLASK_SECRET_KEY` and `TOKEN_ENCRYPTION_KEY`. The latter must remain stable or stored refresh tokens cannot be decrypted. `.env`, SQLite databases, token/session files, and `instance/` are ignored. Run tests with `make test`.
+Put those values in `FLASK_SECRET_KEY` and `TOKEN_ENCRYPTION_KEY`. The latter must remain stable or stored refresh tokens cannot be decrypted. The application loads `.env` itself: **do not run `source .env`**, because shell expansion can corrupt dollar signs in values such as password hashes. `.env`, SQLite databases, token/session files, and `instance/` are ignored. Run tests with `make test`.
 
 ## eBay Sandbox application and OAuth
 
@@ -114,8 +113,11 @@ event IDs are atomically deduplicated.
 
 ## Configuration and local testing
 
-Generate `SELLER_PASSWORD_HASH` with Werkzeug's `generate_password_hash`; never
-store a plaintext password. Set `SELLER_USERNAME`, a strong `FLASK_SECRET_KEY`,
+Generate `SELLER_PASSWORD_HASH` with Werkzeug's `generate_password_hash`; paste
+the complete hash, including its `scrypt:` prefix and every `$`-delimited section,
+and never store a plaintext password. A malformed configured hash is treated as
+an authentication configuration failure without displaying the hash or password.
+Set `SELLER_USERNAME`, a strong `FLASK_SECRET_KEY`,
 and enable `SESSION_COOKIE_SECURE` behind HTTPS. Set `STRIPE_FAKE_MODE=true` for
 network-free development. Production uses `STRIPE_SECRET_KEY`,
 `STRIPE_WEBHOOK_SECRET`, HTTPS success/cancel URLs, plus the existing eBay
@@ -146,13 +148,32 @@ never evidence of payment.
 2. Set `STRIPE_FAKE_MODE=false`, set `STRIPE_SECRET_KEY` to that test key, and
    configure `STRIPE_SHIPPING_COUNTRIES` (the example defaults to `US`). Live
    `sk_live_` keys are rejected at startup.
-3. Run `stripe listen --forward-to http://127.0.0.1:5000/stripe/webhook` and copy
-   the CLI-provided `whsec_...` signing secret into `.env` as
-   `STRIPE_WEBHOOK_SECRET`.
+3. Run exactly one Stripe listener, connected to the same sandbox/account as
+   `STRIPE_SECRET_KEY`, and forward it to `/stripe/webhook`. Copy its current
+   `whsec_...` signing secret into `.env` as `STRIPE_WEBHOOK_SECRET`. Restart
+   Flask whenever that secret changes.
 4. Start Flask, publish a disposable item (mock withdrawal is supported), and
    buy it through Checkout with Stripe's official test card data.
 5. Observe authorization, confirmed eBay withdrawal, capture, sold inventory,
-   and the audit timeline in the authenticated `/orders` dashboard.
+   and the audit timeline in the authenticated `/orders` dashboard. Confirm the
+   relevant deliveries in Stripe receive HTTP 200.
+
+Migration `011_checkout_reliability.sql` preserves all prior rows and labels
+their provider `legacy_unknown`; identifiers such as `cs_test_` are never used
+to guess whether a session was locally faked. New orders persist `fake` or
+`stripe_test`. A fake order may be released when deliberately switching to real
+test Stripe. A missing/unreachable `stripe_test` or `legacy_unknown` session
+retains its reservation and enters review rather than risking a second charge.
+
+Withdrawal, capture, and authorization cancellation have separate durable,
+leased per-order claims. Each ownership decision uses a short `BEGIN IMMEDIATE`
+transaction, while provider calls occur only after commit. Expired claims and
+failed webhook records can be retried; active duplicate delivery is distinguished
+from completed work, and distinct event IDs converge on stable order-derived
+idempotency keys. Ambiguous provider responses, conflicting Stripe identifiers,
+post-capture inventory conflicts, and unclassifiable stale sessions intentionally
+enter `manual_resolution`; they remain reserved for seller investigation and
+webhooks return a retryable non-200 until resolved.
 
 Checkout accepts cards only, uses manual capture, and collects email and a
 shipping address. Shipping fees and tax pricing remain unfinished: the total is

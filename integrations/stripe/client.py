@@ -1,6 +1,7 @@
 from .errors import StripeIntegrationError
 
 class StripeAdapter:
+    identity = "stripe_test"
     def __init__(self, config): self.cfg=config
     def create_checkout(self, order, item, success_url, cancel_url):
         import stripe
@@ -18,7 +19,21 @@ class StripeAdapter:
             raise StripeIntegrationError("provider_error","Payment checkout is temporarily unavailable",ambiguous=True) from exc
     def retrieve_session(self, session_id):
         import stripe
-        return stripe.checkout.Session.retrieve(session_id,api_key=self.cfg.stripe_secret_key,expand=["payment_intent"])
+        try:
+            return stripe.checkout.Session.retrieve(session_id,api_key=self.cfg.stripe_secret_key,expand=["payment_intent"])
+        except Exception as exc:
+            # SDK exception classes vary between supported Stripe releases. Only
+            # the stable class name/status are inspected and neither is exposed.
+            name=type(exc).__name__.lower(); status=getattr(exc,"http_status",None)
+            if name in ("invalidrequesterror",) and status==404:
+                err=StripeIntegrationError("session_not_found","Checkout session was not found",ambiguous=False)
+            elif "authentication" in name or status in (401,403):
+                err=StripeIntegrationError("provider_identity","Checkout account requires review",ambiguous=True)
+            elif any(x in name for x in ("connection","timeout","apierror")):
+                err=StripeIntegrationError("transport","Checkout provider is temporarily unavailable",ambiguous=True)
+            else:
+                err=StripeIntegrationError("session_retrieval_ambiguous","Checkout session requires review",ambiguous=True)
+            raise err from exc
     def capture(self, payment_intent_id, key):
         import stripe
         if not payment_intent_id: raise StripeIntegrationError("missing_payment_intent","Payment authorization is not ready")

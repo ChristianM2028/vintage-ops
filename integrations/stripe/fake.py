@@ -2,6 +2,7 @@ import hashlib, hmac, json
 from .errors import StripeIntegrationError
 
 class FakeStripeAdapter:
+    identity = "fake"
     def __init__(self, config): self.cfg=config; self.sessions={}; self.captures=[]; self.cancellations=[]; self.calls=[]
     def create_checkout(self, order, item, success_url, cancel_url):
         self.calls.append({"order":order["public_id"],"amount":order["price_snapshot"],"currency":order["currency_snapshot"],"quantity":1,"name":item["title"]})

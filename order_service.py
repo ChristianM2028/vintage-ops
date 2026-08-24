@@ -20,11 +20,22 @@ class OrderService:
     def create_checkout(self, sku, prior_id=None):
         prior = self.db.get_order(prior_id) if prior_id else None
         if prior and prior["state"] in ("checkout_pending", "authorization_pending") and prior.get("stripe_checkout_session_id"):
-            if self.cfg.stripe_fake_mode:
+            active=getattr(self.stripe,"identity","fake" if self.cfg.stripe_fake_mode else "stripe_test")
+            if prior.get("stripe_provider_identity")==active and active=="fake":
                 return prior, None
-            remote = self.stripe.retrieve_session(prior["stripe_checkout_session_id"])
-            return prior, _value(remote, "url")
-        order = self.db.create_storefront_order(sku, self.cfg.reservation_seconds)
+            if prior.get("stripe_provider_identity")=="fake" and active=="stripe_test":
+                self.db.release_order(prior["public_id"],"cancelled","fake checkout replaced",source="shopper")
+            else:
+                try:
+                    remote = self.stripe.retrieve_session(prior["stripe_checkout_session_id"])
+                    return prior, _value(remote, "url")
+                except StripeIntegrationError as exc:
+                    # A real or unclassified session is never released merely
+                    # because this process/account cannot currently retrieve it.
+                    self.db.transition_order(prior["public_id"],"manual_resolution",error=json.dumps(exc.safe_dict()),source="shopper",category="stale_session_review")
+                    raise
+        identity=getattr(self.stripe,"identity","fake" if self.cfg.stripe_fake_mode else "stripe_test")
+        order = self.db.create_storefront_order(sku, self.cfg.reservation_seconds, identity)
         item = self.db.get_item(order["item_id"])
         try:
             remote = self.stripe.create_checkout(
@@ -63,6 +74,7 @@ class OrderService:
                 "shipping_phone": _value(shipping, "phone")}
 
     def process_authorization(self, order, session_obj=None, payment_intent=None, source="stripe_webhook"):
+        order=self.db.get_order(order["public_id"])
         if order["state"] in ("sold", "cancelled", "expired", "unavailable", "manual_resolution"):
             return order
         if not order.get("stripe_payment_intent_id") or payment_intent is None:
@@ -76,39 +88,59 @@ class OrderService:
         if status != "requires_capture" or capture_method != "manual":
             return order  # premature/irrelevant delivery is safely recorded by webhook dedupe
         if order["state"] in ("checkout_pending", "authorization_pending"):
-            order = self.db.transition_order(order["public_id"], "authorized", payment_state="authorized", source=source, category="authorization_verified")
+            try: order = self.db.transition_order(order["public_id"], "authorized", payment_state="authorized", source=source, category="authorization_verified")
+            except ValueError: order=self.db.get_order(order["public_id"])
         item = self.db.get_item(order["item_id"])
         if item["status"] == "Sold" or item["quantity"] < 1:
             self.db.transition_order(order["public_id"], "authorization_cancel_pending", conflict="Inventory sold by another channel", source=source, category="inventory_conflict")
             return self._cancel_and_release(order["public_id"], "unavailable", "inventory sold elsewhere", source)
-        if order["state"] == "authorized":
-            order = self.db.transition_order(order["public_id"], "ebay_withdrawal_pending", source=source, category="withdrawal_started")
-        try:
-            if item.get("ebay_publication_state") == "published":
-                self.ebay_resolver(item)[0].delist(item)
-            order = self.db.transition_order(order["public_id"], "capture_pending", source="ebay_reconciliation", category="withdrawal_confirmed")
-        except EbayError as exc:
-            self.db.transition_order(order["public_id"], "authorization_cancel_pending", error=json.dumps(exc.safe_dict()), source="ebay_reconciliation", category="withdrawal_failed")
-            return self._cancel_and_release(order["public_id"], "cancelled", "eBay withdrawal failed", source)
+        withdrawal=self.db.claim_operation(order["public_id"],"ebay_withdrawal")
+        if withdrawal["disposition"] in ("busy","manual_resolution"): return self.db.get_order(order["public_id"])
+        if withdrawal["disposition"]=="claimed":
+            order=self.db.get_order(order["public_id"])
+            if order["state"]=="authorized": order=self.db.transition_order(order["public_id"],"ebay_withdrawal_pending",source=source,category="withdrawal_started")
+            try:
+                item=self.db.get_item(order["item_id"])
+                if item.get("ebay_publication_state") == "published": self.ebay_resolver(item)[0].delist(item)
+                self.db.complete_operation(order["public_id"],"ebay_withdrawal",withdrawal["token"],result="withdrawn")
+            except EbayError as exc:
+                safe=json.dumps({"kind":exc.kind,"message":"eBay withdrawal requires review"})
+                self.db.complete_operation(order["public_id"],"ebay_withdrawal",withdrawal["token"],diagnostic=safe,manual=True)
+                return self.db.transition_order(order["public_id"],"manual_resolution",error=safe,source="ebay_reconciliation",category="withdrawal_ambiguous")
+        order=self.db.get_order(order["public_id"])
+        if order["state"]=="ebay_withdrawal_pending": order=self.db.transition_order(order["public_id"],"capture_pending",source="ebay_reconciliation",category="withdrawal_confirmed")
+        capture=self.db.claim_operation(order["public_id"],"stripe_capture")
+        if capture["disposition"] in ("busy","manual_resolution"): return self.db.get_order(order["public_id"])
+        if capture["disposition"]=="already_complete":
+            order=self.db.get_order(order["public_id"])
+            if order["state"]=="paid": return self.db.finalize_storefront_sale(order["public_id"],source=source)
+            return order
         try:
             result = self.stripe.capture(order["stripe_payment_intent_id"], f"capture:{order['public_id']}")
             if _value(result, "status") != "succeeded":
                 raise StripeIntegrationError("capture_ambiguous", "Capture requires review", ambiguous=True)
+            self.db.complete_operation(order["public_id"],"stripe_capture",capture["token"],result="captured")
             self.db.transition_order(order["public_id"], "paid", payment_state="captured", source=source, category="capture_confirmed")
             return self.db.finalize_storefront_sale(order["public_id"], source=source)
         except StripeIntegrationError as exc:
+            self.db.complete_operation(order["public_id"],"stripe_capture",capture["token"],diagnostic=json.dumps(exc.safe_dict()),manual=True)
             return self.db.transition_order(order["public_id"], "manual_resolution", error=json.dumps(exc.safe_dict()), source=source, category="capture_ambiguous")
 
     def _cancel_and_release(self, public_id, terminal, reason, source):
         order = self.db.get_order(public_id)
         if not order.get("stripe_payment_intent_id"):
             return self.db.transition_order(public_id, "manual_resolution", error='{"kind":"missing_payment_intent","message":"Cancellation requires review","ambiguous":true}', source=source, category="cancellation_ambiguous")
+        claim=self.db.claim_operation(public_id,"stripe_cancel")
+        if claim["disposition"] in ("busy","manual_resolution"): return self.db.get_order(public_id)
+        if claim["disposition"]=="already_complete": return self.db.release_order(public_id,terminal,reason,source=source)
         try:
             result = self.stripe.cancel(order["stripe_payment_intent_id"], f"cancel:{public_id}")
             if _value(result, "status") not in ("canceled", "cancelled"):
                 raise StripeIntegrationError("cancellation_ambiguous", "Cancellation requires review", ambiguous=True)
+            self.db.complete_operation(public_id,"stripe_cancel",claim["token"],result="cancelled")
             return self.db.release_order(public_id, terminal, reason, source=source)
         except StripeIntegrationError as exc:
+            self.db.complete_operation(public_id,"stripe_cancel",claim["token"],diagnostic=json.dumps(exc.safe_dict()),manual=True)
             return self.db.transition_order(public_id, "manual_resolution", error=json.dumps(exc.safe_dict()), source=source, category="cancellation_ambiguous")
 
     def seller_cancel(self, public_id):

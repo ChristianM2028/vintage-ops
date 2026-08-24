@@ -8,6 +8,7 @@ from werkzeug.security import generate_password_hash
 from app import create_app
 from config import Config
 from integrations.stripe.client import StripeAdapter
+from integrations.stripe import StripeIntegrationError
 
 
 def test_live_stripe_keys_are_always_rejected():
@@ -63,3 +64,61 @@ def test_failed_webhook_can_be_claimed_again(tmp_path):
     db.finish_webhook("evt_retry","safe failure")
     assert db.claim_webhook("evt_retry","test")
     assert not db.claim_webhook("evt_retry","test")
+
+
+def test_webhook_and_operation_claim_leases_are_durable(tmp_path):
+    app=create_app(replace(Config(),database_path=str(tmp_path/"claims.sqlite")))
+    db=app.extensions["vintage_db"]
+    assert db.claim_webhook("evt","test")=="claimed"
+    assert db.claim_webhook("evt","test")=="busy"
+    with db.transaction(immediate=True) as con:
+        con.execute("UPDATE stripe_webhook_events SET lease_expires_at='2000-01-01T00:00:00+00:00' WHERE event_id='evt'")
+    assert db.claim_webhook("evt","test")=="claimed"
+    db.finish_webhook("evt","temporary")
+    assert db.claim_webhook("evt","test")=="claimed"
+    db.finish_webhook("evt")
+    with db.connect() as con:
+        row=con.execute("SELECT * FROM stripe_webhook_events WHERE event_id='evt'").fetchone()
+        assert (row["state"],row["attempts"],row["error"])==("processed",3,None)
+
+    item=db.create_item(sku="CLAIM-1",title="Coat",description="",price="25",currency="USD",quantity=1,condition="Used",brand="",size="",color="",category="1",category_name="Coats")
+    db.update_item(item["id"],status="Active",storefront_visible=1)
+    order=db.create_storefront_order("CLAIM-1",provider_identity="fake")
+    first=db.claim_operation(order["public_id"],"stripe_capture",lease_seconds=60)
+    assert first["disposition"]=="claimed"
+    assert db.claim_operation(order["public_id"],"stripe_capture")["disposition"]=="busy"
+    assert db.complete_operation(order["public_id"],"stripe_capture",first["token"],result="captured")=="already_complete"
+    assert db.claim_operation(order["public_id"],"stripe_capture")["disposition"]=="already_complete"
+
+
+def test_provider_identity_merge_and_malformed_hash_are_safe(tmp_path):
+    cfg=replace(Config(),database_path=str(tmp_path/"identity.sqlite"),seller_username="seller",seller_password_hash="not-a-werkzeug-hash")
+    app=create_app(cfg); db=app.extensions["vintage_db"]
+    item=db.create_item(sku="IDENT-1",title="Coat",description="",price="25",currency="USD",quantity=1,condition="Used",brand="",size="",color="",category="1",category_name="Coats")
+    db.update_item(item["id"],status="Active",storefront_visible=1)
+    order=db.create_storefront_order("IDENT-1",provider_identity="stripe_test")
+    order=db.attach_checkout(order["public_id"],"session-one","intent-one")
+    db.attach_payment_intent(order["public_id"],"intent-one",{"customer_email":"buyer@example.test","shipping_name":None})
+    merged=db.attach_payment_intent(order["public_id"],"intent-one",{"customer_email":None,"shipping_name":"Buyer"})
+    assert merged["stripe_provider_identity"]=="stripe_test"
+    assert (merged["customer_email"],merged["shipping_name"])==("buyer@example.test","Buyer")
+    conflict=db.attach_checkout(order["public_id"],"session-two","intent-one")
+    assert conflict["state"]=="manual_resolution"
+    client=app.test_client(); client.get("/login")
+    with client.session_transaction() as session: token=session["csrf_token"]
+    response=client.post("/login",data={"username":"seller","password":"secret hash content","csrf_token":token})
+    assert response.status_code==200
+    assert b"secret hash content" not in response.data and b"not-a-werkzeug-hash" not in response.data
+
+
+def test_retrieve_session_wraps_sdk_failures_without_raw_details(monkeypatch):
+    class InvalidRequestError(Exception):
+        http_status=404
+    class Sessions:
+        @staticmethod
+        def retrieve(*args,**kwargs): raise InvalidRequestError("sk_test_secret raw customer")
+    monkeypatch.setitem(sys.modules,"stripe",SimpleNamespace(checkout=SimpleNamespace(Session=Sessions)))
+    with pytest.raises(StripeIntegrationError) as caught:
+        StripeAdapter(replace(Config(),stripe_fake_mode=False,stripe_secret_key="sk_test_example")).retrieve_session("session")
+    assert caught.value.kind=="session_not_found" and not caught.value.ambiguous
+    assert "secret" not in str(caught.value)
