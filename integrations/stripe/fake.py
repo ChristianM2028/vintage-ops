@@ -8,7 +8,9 @@ class FakeStripeAdapter:
         self.calls.append({"order":order["public_id"],"amount":order["price_snapshot"],"currency":order["currency_snapshot"],"quantity":1,"name":item["title"]})
         sid="cs_test_"+order["public_id"][:16]; pi="pi_test_"+order["public_id"][:16]
         result={"id":sid,"payment_intent":pi,"url":f"/shop/order/{order['public_id']}"}; self.sessions[sid]=result
-        self.payment_intents[pi]={"amount_received":int(round(float(order["price_snapshot"])*100)),"currency":order["currency_snapshot"].lower()}
+        amount=int(round(float(order["price_snapshot"])*100))
+        self.payment_intents[pi]={"id":pi,"status":"requires_capture","capture_method":"manual",
+            "amount":amount,"amount_capturable":amount,"amount_received":0,"currency":order["currency_snapshot"].upper()}
         return result
     def retrieve_session(self,session_id):
         session=self.sessions.get(session_id)
@@ -16,11 +18,24 @@ class FakeStripeAdapter:
             raise StripeIntegrationError("session_not_found","Checkout session was not found",ambiguous=False)
         return session
     def capture(self,payment_intent_id,key):
-        if key not in [x[1] for x in self.captures]: self.captures.append((payment_intent_id,key))
-        return {"id":payment_intent_id,"status":"succeeded",**self.payment_intents.get(payment_intent_id,{})}
+        intent=self.payment_intents.get(payment_intent_id)
+        if not intent:
+            # The development fake is process-local; preserve the historical
+            # restart path without inventing provider-confirmed money.
+            intent=self.payment_intents.setdefault(payment_intent_id,{"id":payment_intent_id,"status":"requires_capture","capture_method":"manual","amount":None,"amount_capturable":None,"amount_received":None,"currency":None})
+        if key not in [x[1] for x in self.captures]:
+            self.captures.append((payment_intent_id,key)); intent.update(status="succeeded",amount_received=intent.get("amount"),amount_capturable=0)
+        return dict(intent)
     def cancel(self,payment_intent_id,key):
-        if key not in [x[1] for x in self.cancellations]: self.cancellations.append((payment_intent_id,key))
-        return {"id":payment_intent_id,"status":"canceled"}
+        intent=self.payment_intents.get(payment_intent_id)
+        if not intent: intent=self.payment_intents.setdefault(payment_intent_id,{"id":payment_intent_id,"status":"requires_capture","capture_method":"manual","amount":None,"amount_capturable":None,"amount_received":None,"currency":None})
+        if key not in [x[1] for x in self.cancellations]:
+            self.cancellations.append((payment_intent_id,key)); intent.update(status="canceled",amount_capturable=0)
+        return dict(intent)
+    def retrieve_payment_intent(self,payment_intent_id):
+        intent=self.payment_intents.get(payment_intent_id)
+        if not intent: raise StripeIntegrationError("not_found","Payment authorization requires review",ambiguous=True)
+        return {k:intent.get(k) for k in ("id","status","capture_method","amount","amount_capturable","amount_received","currency")}
     def create_full_refund(self,payment_intent_id,amount,currency,public_id):
         key=f"refund:{public_id}:full:v1"
         if key in self.refund_keys: return dict(self.refunds[self.refund_keys[key]])

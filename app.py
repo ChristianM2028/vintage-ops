@@ -18,6 +18,7 @@ from integrations.stripe import StripeAdapter, FakeStripeAdapter, StripeIntegrat
 from order_service import OrderService
 from fulfillment_service import FulfillmentService, FulfillmentError
 from refund_service import RefundService, RefundError
+from manual_resolution_service import ManualResolutionService, ManualResolutionError
 
 IMAGE_SIGNATURES={"jpg":lambda b:b.startswith(b"\xff\xd8\xff"),"jpeg":lambda b:b.startswith(b"\xff\xd8\xff"),"png":lambda b:b.startswith(b"\x89PNG\r\n\x1a\n"),"gif":lambda b:b.startswith((b"GIF87a",b"GIF89a")),"webp":lambda b:len(b)>=12 and b[:4]==b"RIFF" and b[8:12]==b"WEBP"}
 
@@ -65,6 +66,7 @@ def create_app(config=None, http=None, stripe_adapter=None):
             return real_components(overrides)[1],item
         raise EbayError("classification_required","Choose an eBay integration mode before operating on this item")
     order_service=OrderService(db,stripe_gateway,resolve_ebay,cfg)
+    manual_resolution_service=ManualResolutionService(db,stripe_gateway,resolve_ebay,cfg)
     fulfillment_service=FulfillmentService(db)
     refund_service=RefundService(db,stripe_gateway)
     def adapters():
@@ -84,7 +86,7 @@ def create_app(config=None, http=None, stripe_adapter=None):
     def seller_guard():
         # Order fulfillment data is never public, even on an incompletely
         # configured development install where the legacy seller UI is open.
-        always_protected={"orders","order_detail","seller_cancel_order","seller_retry_order","seller_refund_order","seller_recheck_refund","mark_packing","mark_shipped","correct_tracking","mark_delivered","add_order_note","acknowledge_attention"}
+        always_protected={"orders","order_detail","seller_cancel_order","seller_retry_order","seller_refund_order","seller_recheck_refund","manual_recheck","manual_resume","manual_cancel","manual_reconcile_canceled","manual_reconcile_captured","mark_packing","mark_shipped","correct_tracking","mark_delivered","add_order_note","acknowledge_attention"}
         if request.endpoint not in always_protected and (not cfg.seller_username or not cfg.seller_password_hash): return
         if request.endpoint in public_endpoints: return
         if not session.get("seller_authenticated"):
@@ -250,6 +252,10 @@ def create_app(config=None, http=None, stripe_adapter=None):
         if claim != "claimed": return "",503
         try:
             obj=(event.get("data") or {}).get("object") or {}
+            relevant={"checkout.session.completed","checkout.session.expired","payment_intent.amount_capturable_updated","payment_intent.succeeded","payment_intent.canceled","charge.refunded","refund.created","refund.updated","refund.failed"}
+            if event_type not in relevant:
+                db.correlate_webhook(event_id,"irrelevant")
+                db.finish_webhook(event_id,claim_token=claim["claim_token"]); return "",200
             normalized_refunds=refund_service.normalize_webhook(event_type,obj)
             if normalized_refunds:
                 for refund in normalized_refunds:
@@ -260,7 +266,8 @@ def create_app(config=None, http=None, stripe_adapter=None):
                     # Metadata may locate an order, but only its already-persisted
                     # PaymentIntent is trusted for the eventual exact match.
                     if order: refund_service.reconcile(order,refund,actor="stripe_webhook")
-                db.finish_webhook(event_id); return "",200
+                db.correlate_webhook(event_id,"matched" if order else "unmatched_retryable",payment_intent_id=pi_id,reference=reference,matched_order_id=order["id"] if order else None)
+                db.finish_webhook(event_id,claim_token=claim["claim_token"]); return "",200
             sid=obj.get("id") if event_type.startswith("checkout.session") else obj.get("checkout_session")
             metadata=obj.get("metadata") or {}; reference=obj.get("client_reference_id") or metadata.get("order")
             pi=obj.get("payment_intent") or (obj.get("id") if event_type.startswith("payment_intent") else None)
@@ -275,12 +282,13 @@ def create_app(config=None, http=None, stripe_adapter=None):
                 if outcome["state"]=="manual_resolution": raise RuntimeError("manual_resolution")
             elif order and event_type in ("checkout.session.expired","payment_intent.canceled") and order["state"] in ("checkout_pending","authorization_pending"):
                 db.release_order(order["public_id"],"expired" if event_type=="checkout.session.expired" else "cancelled",event_type,source="stripe_webhook")
-            db.finish_webhook(event_id); return "",200
+            db.correlate_webhook(event_id,"matched" if order else "unmatched_retryable",sid,pi_id,reference,order["id"] if order else None)
+            db.finish_webhook(event_id,claim_token=claim["claim_token"]); return "",200
         except Exception as exc:
             classification="manual_resolution" if type(exc).__name__=="RuntimeError" else "processing_failure"
             known=order["public_id"] if "order" in locals() and order else None
             app.logger.warning("Stripe webhook failure event_id=%s event_type=%s order=%s classification=%s",event_id,event_type,known,classification)
-            db.finish_webhook(event_id,classification); return "",503
+            db.finish_webhook(event_id,classification,claim["claim_token"]); return "",503
 
     def fake_development_mode(): return cfg.stripe_fake_mode and cfg.environment != "production"
     def render_order(public_id, **context):
@@ -328,7 +336,27 @@ def create_app(config=None, http=None, stripe_adapter=None):
         return render_template("orders.html",orders=rows,filters=filters,page=page,pages=max(1,(total+24)//25),states=sorted(states),payment_states=sorted(payment_states))
 
     @app.get("/orders/<public_id>")
-    def order_detail(public_id): return render_template("order_detail.html",order=db.seller_order(public_id) or abort(404))
+    def order_detail(public_id): return render_template("order_detail.html",order=db.seller_order(public_id) or abort(404),manual=manual_resolution_service.available_actions(public_id))
+    def manual_action(call):
+        try: call()
+        except ManualResolutionError as exc: abort(409,str(exc))
+        return redirect(url_for("order_detail",public_id=request.view_args["public_id"]),code=303)
+    @app.post("/orders/<public_id>/manual-resolution/recheck")
+    def manual_recheck(public_id): return manual_action(lambda: manual_resolution_service.recheck(public_id,request.form.get("request_token")))
+    @app.post("/orders/<public_id>/manual-resolution/resume")
+    def manual_resume(public_id):
+        if request.form.get("confirmation")!="CAPTURE": abort(400,"Type CAPTURE to continue")
+        return manual_action(lambda: manual_resolution_service.resume_purchase(public_id,int(request.form.get("review_id",0)),request.form.get("request_token")))
+    @app.post("/orders/<public_id>/manual-resolution/cancel")
+    def manual_cancel(public_id):
+        if request.form.get("confirmation")!="CANCEL": abort(400,"Type CANCEL to continue")
+        return manual_action(lambda: manual_resolution_service.cancel_authorization(public_id,int(request.form.get("review_id",0)),request.form.get("request_token")))
+    @app.post("/orders/<public_id>/manual-resolution/reconcile-canceled")
+    def manual_reconcile_canceled(public_id): return manual_action(lambda: manual_resolution_service.reconcile_canceled(public_id,int(request.form.get("review_id",0)),request.form.get("request_token")))
+    @app.post("/orders/<public_id>/manual-resolution/reconcile-captured")
+    def manual_reconcile_captured(public_id):
+        if request.form.get("confirmation")!="CAPTURE": abort(400,"Type CAPTURE to continue")
+        return manual_action(lambda: manual_resolution_service.reconcile_captured(public_id,int(request.form.get("review_id",0)),request.form.get("request_token")))
     def fulfillment_action(call):
         try: call()
         except FulfillmentError as exc: abort(409,str(exc))
@@ -557,7 +585,7 @@ def create_app(config=None, http=None, stripe_adapter=None):
         except EbayError as error:
             flash(json.dumps(error.safe_dict()),"error")
         return redirect(url_for("sandbox"))
-    app.extensions.update(vintage_db=db,stripe_adapter=stripe_gateway,order_service=order_service,fulfillment_service=fulfillment_service,refund_service=refund_service,ebay_components=real_components,ebay_metadata=metadata_component(),ebay_metadata_factory=metadata_component,marketplace_adapters=adapters)
+    app.extensions.update(vintage_db=db,stripe_adapter=stripe_gateway,order_service=order_service,manual_resolution_service=manual_resolution_service,fulfillment_service=fulfillment_service,refund_service=refund_service,ebay_components=real_components,ebay_metadata=metadata_component(),ebay_metadata_factory=metadata_component,marketplace_adapters=adapters)
     return app
 
 if __name__ == "__main__":

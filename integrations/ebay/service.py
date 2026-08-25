@@ -88,14 +88,25 @@ class EbayService:
     def delist(self,item): return self.delistItem(item)
     def update(self,item): return self.updateItem(item)
     def synchronize(self,item):
-        if not item.get("ebay_offer_id"): return self.db.update_item(item["id"],ebay_sync_state="missing")
-        try: remote=self.client.request("GET",f"/sell/inventory/v1/offer/{quote(item['ebay_offer_id'],safe='')}")
-        except EbayError as e:
-            if e.status==404: return self.db.update_item(item["id"],ebay_publication_state="missing",ebay_sync_state="missing")
-            self.db.update_item(item["id"],ebay_sync_state="transient_error",last_error=json.dumps(e.safe_dict())); raise
-        status=(remote.get("status") or "").upper(); listing=remote.get("listing") or {}
-        state="published" if status in ("PUBLISHED","ACTIVE") else "withdrawn" if status in ("WITHDRAWN","ENDED") else status.lower() or "unknown"
-        return self.db.update_item(item["id"],ebay_listing_id=listing.get("listingId") or item.get("ebay_listing_id"),ebay_publication_state=state,ebay_sync_state="synchronized",last_error=None)
+        observation=self.inspect_offer(item)
+        state=observation["classification"]
+        if state=="ambiguous":
+            self.db.update_item(item["id"],ebay_sync_state="transient_error"); raise EbayError("remote","eBay state requires review")
+        return self.db.update_item(item["id"],ebay_listing_id=observation.get("listing_id") or item.get("ebay_listing_id"),ebay_publication_state=state,ebay_sync_state="missing" if state=="missing" else "synchronized",last_error=None)
+    def inspect_offer(self,item):
+        """Inspect only the persisted offer identity and return a safe projection."""
+        offer=item.get("ebay_offer_id")
+        if not offer: return {"classification":"ambiguous","offer_id":None,"listing_id":None,"status":None,"error_kind":"missing_identifier"}
+        try: remote=self.client.request("GET",f"/sell/inventory/v1/offer/{quote(offer,safe='')}")
+        except EbayError as exc:
+            return {"classification":"missing" if exc.status==404 else "ambiguous","offer_id":offer,
+                "listing_id":item.get("ebay_listing_id"),"status":None,"error_kind":"not_found" if exc.status==404 else "provider_error",
+                "request_id":getattr(exc,"request_id",None),"correlation_id":getattr(exc,"rlogid",None)}
+        remote_offer=remote.get("offerId")
+        status=str(remote.get("status") or "").upper(); listing=(remote.get("listing") or {}).get("listingId")
+        classification=("ambiguous" if remote_offer and remote_offer!=offer else "published" if status in ("PUBLISHED","ACTIVE") else
+            "withdrawn" if status in ("WITHDRAWN","ENDED") else "ambiguous")
+        return {"classification":classification,"offer_id":offer,"listing_id":listing or item.get("ebay_listing_id"),"status":status or None}
     def reconcile_orders(self):
         data=self.client.request("GET","/sell/fulfillment/v1/order?filter=orderfulfillmentstatus:%7BNOT_STARTED,IN_PROGRESS%7D")
         counts={"processed":0,"duplicate":0,"unknown":0}
