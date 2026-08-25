@@ -354,6 +354,50 @@ shipping address. Shipping fees and tax pricing remain unfinished: the total is
 only the server-side item-price snapshot. The Stripe SDK/API contract is pinned
 by `requirements.txt`; webhook fixtures must be reviewed when that pin changes.
 
+## Railway scheduled maintenance
+
+Deploy the Flask application as the **web service** using `railway.toml`. Only
+that service mounts the persistent `/data` volume, where SQLite and uploaded
+media live. Create a separate **cron service** from the same repository with the
+start command `python scripts/run_scheduled_job.py` and schedule
+`*/5 * * * *` (every five minutes, UTC). The cron service makes one HTTPS call;
+it must not mount `/data` and never opens SQLite or imports Flask.
+
+Generate a high-entropy shared secret (for example, `python -c
+'import secrets; print(secrets.token_urlsafe(48))'`) in a trusted terminal. Store
+the exact same value as `SCHEDULED_JOB_TOKEN` in both Railway services and set
+`SCHEDULED_JOB_URL` on the cron service to the fixed HTTPS URL ending in
+`/internal/scheduled-maintenance`. Never put the secret in a URL, command line,
+or log. Rotate it by installing a newly generated value on both services during
+a short coordinated deployment window; a mismatch safely returns 401.
+
+For a safe manual invocation, keep the secret in the environment and send it
+only as a header:
+
+```sh
+curl --fail-with-body --request POST \
+  --header "Authorization: Bearer $SCHEDULED_JOB_TOKEN" \
+  --header "Accept: application/json" \
+  "$SCHEDULED_JOB_URL"
+```
+
+A successful run returns HTTP 200 and an allow-listed JSON summary with
+`status: ok`. HTTP 409 with `status: busy` means a live invocation owns the
+lease and no duplicate work ran. Missing, malformed, unset, or incorrect
+credentials all receive the same HTTP 401 response. Required provider work that
+cannot finish returns a non-2xx response with `status: failed` and sanitized
+failure categories; it does not include provider payloads, customer data,
+credentials, or exception text.
+
+Alert on missed five-minute schedules, consecutive non-2xx results, increasing
+sanitized failure counts, eBay latency/timeouts, and a running lease older than
+its configured expiry. During a provider outage, leave the durable state intact
+and retry after recovery. A terminated worker's lease becomes reclaimable after
+expiry; do not edit ownership tokens manually. After token rotation, correct a
+401 by verifying both services have matching secret variables and redeploying.
+Repeated invocation is safe: reservation state guards and durable eBay
+order/line identifiers prevent duplicate cleanup and inventory decrements.
+
 ## Explicit non-goals
 
 The current scope intentionally excludes:

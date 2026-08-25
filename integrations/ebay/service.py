@@ -1,5 +1,5 @@
 import json
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from .errors import EbayError
 
 class EbayService:
@@ -108,15 +108,35 @@ class EbayService:
             "withdrawn" if status in ("WITHDRAWN","ENDED") else "ambiguous")
         return {"classification":classification,"offer_id":offer,"listing_id":listing or item.get("ebay_listing_id"),"status":status or None}
     def reconcile_orders(self,max_orders=None):
-        data=self.client.request("GET","/sell/fulfillment/v1/order?filter=orderfulfillmentstatus:%7BNOT_STARTED,IN_PROGRESS%7D")
-        counts={"processed":0,"duplicate":0,"unknown":0}
-        orders=data.get("orders",[])
-        if max_orders is not None: orders=orders[:max_orders]
-        for order in orders:
+        maximum=min(max_orders if max_orders is not None else self.cfg.ebay_order_max_orders,self.cfg.ebay_order_max_orders)
+        if not isinstance(maximum,int) or isinstance(maximum,bool) or maximum < 1: raise ValueError("max_orders must be positive")
+        counts={"processed":0,"duplicate":0,"unknown":0,"pages_fetched":0}
+        offset=0; seen_orders=0
+        while seen_orders < maximum and counts["pages_fetched"] < self.cfg.ebay_order_max_pages:
+            page_size=min(self.cfg.ebay_order_page_size,maximum-seen_orders)
+            if hasattr(self.client,"order_page"):
+                data=self.client.order_page(limit=page_size,offset=offset)
+            else: # Preserve the small adapter contract used by existing fakes.
+                query=urlencode({"filter":"orderfulfillmentstatus:{NOT_STARTED,IN_PROGRESS}","limit":page_size,"offset":offset})
+                data=self.client.request("GET","/sell/fulfillment/v1/order?"+query)
+            orders=data.get("orders",[])
+            if not isinstance(orders,list): raise EbayError("remote","eBay returned an invalid orders page")
+            counts["pages_fetched"]+=1
+            if len(orders)>page_size: raise EbayError("remote","eBay exceeded the requested page size")
+            for order in orders:
+                if seen_orders>=maximum: break
+                seen_orders+=1
+                self._reconcile_order(order,counts)
+            if len(orders)<page_size: break
+            offset+=len(orders)
+        if seen_orders < maximum and counts["pages_fetched"] >= self.cfg.ebay_order_max_pages and len(orders)==page_size:
+            raise EbayError("remote","eBay reconciliation page limit reached before completion")
+        return counts
+
+    def _reconcile_order(self,order,counts):
             payment=(order.get("orderPaymentStatus") or "").upper()
             for line in order.get("lineItems",[]):
                 sku=line.get("sku"); listing=(line.get("legacyItemId") or line.get("listingId")); qty=int(line.get("quantity",1))
                 fresh=self.db.process_order_line(order["orderId"],line["lineItemId"],sku,listing,qty,payment,order.get("orderFulfillmentStatus"),order)
                 counts["processed" if fresh else "duplicate"]+=1
                 if fresh and not any((x.get("ebay_sku")==sku or x.get("ebay_listing_id")==listing) for x in self.db.inventory()): counts["unknown"]+=1
-        return counts

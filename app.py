@@ -21,6 +21,7 @@ from order_service import OrderService
 from fulfillment_service import FulfillmentService, FulfillmentError
 from refund_service import RefundService, RefundError
 from manual_resolution_service import ManualResolutionService, ManualResolutionError
+from scheduled_jobs import run_scheduled_job
 
 IMAGE_SIGNATURES={"jpg":lambda b:b.startswith(b"\xff\xd8\xff"),"jpeg":lambda b:b.startswith(b"\xff\xd8\xff"),"png":lambda b:b.startswith(b"\x89PNG\r\n\x1a\n"),"gif":lambda b:b.startswith((b"GIF87a",b"GIF89a")),"webp":lambda b:len(b)>=12 and b[:4]==b"RIFF" and b[8:12]==b"WEBP"}
 
@@ -90,9 +91,9 @@ def create_app(config=None, http=None, stripe_adapter=None):
     @app.before_request
     def csrf_protect():
         expected=session.get("csrf_token")
-        if request.method=="POST" and request.endpoint!="stripe_webhook" and (not expected or not secrets.compare_digest(expected, request.form.get("csrf_token", ""))): abort(400,"Invalid CSRF token")
+        if request.method=="POST" and request.endpoint not in {"stripe_webhook","scheduled_maintenance"} and (not expected or not secrets.compare_digest(expected, request.form.get("csrf_token", ""))): abort(400,"Invalid CSRF token")
 
-    public_endpoints={"healthz","shop","shop_item","media","checkout","order_status","order_success","order_cancel","fake_complete_order","fake_cancel_order","stripe_webhook","static","login"}
+    public_endpoints={"healthz","shop","shop_item","media","checkout","order_status","order_success","order_cancel","fake_complete_order","fake_cancel_order","stripe_webhook","scheduled_maintenance","static","login"}
     @app.before_request
     def seller_guard():
         # Order fulfillment data is never public, even on an incompletely
@@ -105,6 +106,16 @@ def create_app(config=None, http=None, stripe_adapter=None):
 
     @app.get("/healthz")
     def healthz(): return jsonify({"status":"ok"})
+
+    @app.post("/internal/scheduled-maintenance")
+    def scheduled_maintenance():
+        supplied=request.headers.get("Authorization","")
+        expected="Bearer "+cfg.scheduled_job_token if cfg.scheduled_job_token else ""
+        if not expected or not supplied.startswith("Bearer ") or not secrets.compare_digest(supplied,expected):
+            return jsonify({"status":"unauthorized"}),401
+        ebay=None if cfg.marketplace_mock_mode else adapters()["ebay"]
+        result=run_scheduled_job(db,ebay,limit=cfg.scheduled_job_limit,lease_seconds=cfg.scheduled_job_lease_seconds)
+        return jsonify(result), (200 if result["status"]=="ok" else 409 if result["status"]=="busy" else 502)
 
     @app.route("/login",methods=["GET","POST"])
     def login():
@@ -586,7 +597,9 @@ def create_app(config=None, http=None, stripe_adapter=None):
     @click.option("--limit",type=int,default=100,show_default=True)
     def storefront_maintenance(limit):
         """Expire a bounded batch of stale storefront reservations."""
-        click.echo(f"expired={db.expire_reservations(bounded(limit))}")
+        result=run_scheduled_job(db,None,cleanup=True,reconcile=False,limit=bounded(limit),lease_seconds=cfg.scheduled_job_lease_seconds,job_name="storefront-maintenance")
+        if result["status"]!="ok": raise click.ClickException("storefront maintenance failed")
+        click.echo(f"expired={result['expired_reservations']}")
     @app.cli.command("ebay-reconcile-orders")
     @click.option("--limit",type=int,default=100,show_default=True)
     def ebay_reconcile_cli(limit):
@@ -594,10 +607,12 @@ def create_app(config=None, http=None, stripe_adapter=None):
         limit=bounded(limit)
         if cfg.environment != "sandbox": raise click.ClickException("eBay reconciliation is restricted to Sandbox")
         if cfg.marketplace_mock_mode: raise click.ClickException("eBay reconciliation requires the Sandbox provider")
-        try: result=adapters()["ebay"].reconcile_orders(max_orders=limit)
+        try: summary=run_scheduled_job(db,adapters()["ebay"],cleanup=False,reconcile=True,limit=limit,lease_seconds=cfg.scheduled_job_lease_seconds,job_name="ebay-reconcile-orders")
         except Exception as exc:
             app.logger.error("Sandbox eBay reconciliation failed: %s",type(exc).__name__)
             raise click.ClickException("eBay reconciliation failed") from exc
+        if summary["status"]!="ok": raise click.ClickException("eBay reconciliation failed")
+        result={"processed":summary["orders_processed"],"duplicate":summary["duplicates"],"unknown":summary["unknown_items"]}
         click.echo(" ".join(f"{key}={result.get(key,0)}" for key in ("processed","duplicate","unknown")))
     @app.route("/sandbox",methods=["GET","POST"])
     def sandbox():

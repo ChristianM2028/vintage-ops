@@ -36,6 +36,25 @@ class Database:
                 if con.execute("SELECT 1 FROM schema_migrations WHERE version=?",(name,)).fetchone(): continue
                 con.executescript(open(os.path.join(root,name), encoding="utf8").read())
                 con.execute("INSERT INTO schema_migrations VALUES (?,?)",(name,now()))
+    def acquire_scheduled_job(self, job_name, lease_seconds=240):
+        token=secrets.token_urlsafe(32); stamp=now()
+        expiry=(datetime.now(timezone.utc)+timedelta(seconds=lease_seconds)).isoformat()
+        with self.transaction(immediate=True) as c:
+            row=c.execute("SELECT state,lease_expires_at FROM scheduled_job_leases WHERE job_name=?",(job_name,)).fetchone()
+            if row and row["state"]=="running" and row["lease_expires_at"]>stamp:
+                return {"disposition":"busy","ownership_token":None}
+            if row:
+                changed=c.execute("UPDATE scheduled_job_leases SET ownership_token=?,lease_expires_at=?,state='running',result_metadata=NULL,updated_at=?,completed_at=NULL WHERE job_name=? AND (state!='running' OR lease_expires_at<=?)",(token,expiry,stamp,job_name,stamp)).rowcount
+                if not changed: return {"disposition":"busy","ownership_token":None}
+            else:
+                c.execute("INSERT INTO scheduled_job_leases VALUES(?,?,?,'running',NULL,?,?,NULL)",(job_name,token,expiry,stamp,stamp))
+        return {"disposition":"acquired","ownership_token":token}
+
+    def finish_scheduled_job(self, job_name, ownership_token, success, result_metadata=None):
+        metadata=json.dumps(result_metadata or {},sort_keys=True,separators=(",",":"))
+        with self.transaction(immediate=True) as c:
+            changed=c.execute("UPDATE scheduled_job_leases SET state=?,result_metadata=?,lease_expires_at=?,completed_at=?,updated_at=? WHERE job_name=? AND ownership_token=? AND state='running'",("complete" if success else "failed",metadata,now(),now(),now(),job_name,ownership_token)).rowcount
+        return Disposition("claimed" if changed else "superseded")
     def get_seller_setup(self):
         with self.connect() as con:
             row=con.execute("SELECT * FROM ebay_seller_setup WHERE id=1").fetchone()
