@@ -11,6 +11,7 @@ restartPolicyType = "ON_FAILURE"
 [variables]
 DATABASE_PATH = "/data/vintage_ops.sqlite3"
 UPLOAD_DIRECTORY = "/data/uploads"
+BACKUP_DIRECTORY = "/data/backups"
 EBAY_ENVIRONMENT = "sandbox"
 PROXY_FIX_PROTO = "1"
 PROXY_FIX_HOST = "1"

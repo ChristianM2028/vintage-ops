@@ -47,15 +47,43 @@ There is deliberately no in-process scheduler or unauthenticated maintenance
 endpoint. Both commands validate their 1–500 bound; provider/configuration errors
 produce a nonzero exit status, and eBay automation is Sandbox-only.
 
-Before migrations, retain and verify a backup. For a running database, use
-SQLite's online backup API (for example Python `sqlite3.Connection.backup`) or
-`VACUUM INTO` to create a consistent database copy; never copy the live database
-file naively. Back up `/data/uploads` with it. To restore, stop the web service
-and every Cron/automation process, replace the database and uploads together,
-verify ownership and permissions, then start one web instance. Confirm `/healthz`,
-seller login, inventory/photo access, schema migration completion, and safe CLI
-dry operational results before resuming automation. Keep the verified pre-migration
-backup until post-restore/application validation is complete.
+### Backup and restore runbook
+
+Create an application archive from a Railway service shell, where the `/data`
+volume is mounted:
+
+```sh
+railway run flask --app 'app:create_app()' create-backup
+```
+
+`railway run` must execute against the deployed service/container (not merely a
+local process with Railway variables); the service-shell equivalent is preferred
+when confirming that `/data` is mounted. Record the emitted `/data/backups/...tar.gz`
+path. With Railway CLI 4.x's `ssh` command, stream that exact remote file to a
+local file, explicitly selecting the service and environment (replace all three
+placeholders):
+
+```sh
+railway ssh --service <SERVICE> --environment <ENVIRONMENT> "cat /data/backups/<ARCHIVE>.tar.gz" > <ARCHIVE>.tar.gz
+```
+
+This environment did not have the Railway CLI installed, so operators must run
+`railway --version` and `railway ssh --help` and confirm the file-stream syntax
+against their installed version before relying on it. Verify the downloaded tar
+member paths, extract it only into a staging directory, and run
+`PRAGMA integrity_check` against `database.sqlite3`. Remove remote archives only
+with `flask prune-backups --keep-count N --dry-run`; inspect the archive names,
+then repeat without `--dry-run`.
+
+Never use `railway variables` or an environment export as a backup, copy a live
+SQLite/WAL/SHM file directly, recursively download `/data`, or add secrets or
+`.env` files to an archive. To restore: stop the web service and every automation
+process; extract into staging; reject absolute, parent-traversal, link, and special
+archive members; validate SQLite integrity; replace the database and uploads
+together; restore restrictive ownership and permissions; then restart. Finally,
+check `/healthz`, seller login, inventory and photos, migrations, and safe CLI dry
+runs before resuming automation. Retain the pre-migration backup until validation
+is complete.
 
 ## Stack and setup
 

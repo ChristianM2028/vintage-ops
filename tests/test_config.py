@@ -38,3 +38,9 @@ assert os.environ["DATABASE_PATH"] == "from-process.sqlite3"
     assert result.returncode == 0, "isolated config import failed"
     assert result.stdout == ""
     assert result.stderr == ""
+
+
+def test_backup_directory_has_local_default(monkeypatch):
+    monkeypatch.delenv("BACKUP_DIRECTORY", raising=False)
+    from config import Config
+    assert Config().backup_directory == "instance/backups"
