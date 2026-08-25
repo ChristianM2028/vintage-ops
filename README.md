@@ -2,6 +2,61 @@
 
 A deliberately small local Flask/SQLite seller application for preparing clothing inventory and publishing it to eBay. It uses one Python runtime, server-rendered pages, encrypted seller tokens, and no browser-side credentials. A narrow adapter boundary keeps the real eBay integration isolated.
 
+## Railway Sandbox deployment (not for live commerce)
+
+> **Sandbox only:** this checked-in Railway configuration must never be used with
+> live Stripe credentials or production eBay. Use only `sk_test_` Stripe keys and
+> keep `EBAY_ENVIRONMENT=sandbox`; the reconciliation command refuses production.
+
+Provision one persistent Railway volume mounted at `/data`. The checked-in
+configuration fixes `DATABASE_PATH=/data/vintage_ops.sqlite3` and
+`UPLOAD_DIRECTORY=/data/uploads`, enables exactly one trusted Railway hop for
+forwarded scheme and host, and checks `GET /healthz`. Railway supplies `PORT`;
+do not define or hard-code it. Gunicorn runs one worker (required for this SQLite
+deployment), four threads, a 60-second timeout, and a 30-second graceful timeout.
+
+Configure these Railway variables/secrets: a strong random `FLASK_SECRET_KEY`, a
+stable Fernet `TOKEN_ENCRYPTION_KEY`, `SELLER_USERNAME`, a Werkzeug-generated
+`SELLER_PASSWORD_HASH`, `SESSION_COOKIE_SECURE=true`, `PROXY_FIX_PROTO=1`,
+`PROXY_FIX_HOST=1`, `EBAY_ENVIRONMENT=sandbox`, Sandbox-only `EBAY_CLIENT_ID`,
+`EBAY_CLIENT_SECRET`, `EBAY_RUNAME`, and `EBAY_CALLBACK_URL`, plus the applicable
+marketplace/location/policy settings. Set `MARKETPLACE_MOCK_MODE=false`. For
+Stripe use only `STRIPE_FAKE_MODE=false`, an `sk_test_...` `STRIPE_SECRET_KEY`,
+`STRIPE_WEBHOOK_SECRET`, and public HTTPS `STRIPE_SUCCESS_URL` and
+`STRIPE_CANCEL_URL` values containing `{ORDER_ID}`. Keep every credential in
+Railway secrets, never deployment files.
+
+In Stripe test mode, create a webhook at
+`https://<railway-domain>/stripe/webhook`, select the events used by the app
+(`checkout.session.completed`, `checkout.session.expired`, the relevant
+PaymentIntent authorization/success/cancellation events, and refund events), and
+store its signing secret only as `STRIPE_WEBHOOK_SECRET`. In the eBay Sandbox
+application, register the exact `https://<railway-domain>/ebay/callback`; that
+accepted callback, `EBAY_CALLBACK_URL`, and the Sandbox RuName in `EBAY_RUNAME`
+must stay consistent.
+
+Use one external Railway Cron trigger per task—never multiple overlapping
+schedulers—and invoke bounded commands such as:
+
+```sh
+flask --app 'app:create_app()' storefront-maintenance --limit 100
+flask --app 'app:create_app()' ebay-reconcile-orders --limit 100
+```
+
+There is deliberately no in-process scheduler or unauthenticated maintenance
+endpoint. Both commands validate their 1–500 bound; provider/configuration errors
+produce a nonzero exit status, and eBay automation is Sandbox-only.
+
+Before migrations, retain and verify a backup. For a running database, use
+SQLite's online backup API (for example Python `sqlite3.Connection.backup`) or
+`VACUUM INTO` to create a consistent database copy; never copy the live database
+file naively. Back up `/data/uploads` with it. To restore, stop the web service
+and every Cron/automation process, replace the database and uploads together,
+verify ownership and permissions, then start one web instance. Confirm `/healthz`,
+seller login, inventory/photo access, schema migration completion, and safe CLI
+dry operational results before resuming automation. Keep the verified pre-migration
+backup until post-restore/application validation is complete.
+
 ## Stack and setup
 
 Prerequisites: Python 3.11+ and an eBay Developers Program Sandbox account.

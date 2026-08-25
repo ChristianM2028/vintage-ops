@@ -1,0 +1,16 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "/app/start.sh"
+healthcheckPath = "/healthz"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
+
+[variables]
+DATABASE_PATH = "/data/vintage_ops.sqlite3"
+UPLOAD_DIRECTORY = "/data/uploads"
+EBAY_ENVIRONMENT = "sandbox"
+PROXY_FIX_PROTO = "1"
+PROXY_FIX_HOST = "1"
