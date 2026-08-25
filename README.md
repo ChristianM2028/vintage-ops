@@ -93,6 +93,68 @@ The integration follows the official eBay REST resources: Taxonomy category tree
 Fulfillment reconciliation records every `(orderId, lineItemId)` once. A `PAID` line decrements quantity atomically and hides zero-stock items immediately. Pending/failed payment is recorded but does not reserve or decrement local stock. Cancellation and refund data is retained for audit and synchronization, but Vintage Ops does not automatically relist or increase stock because return disposition may be unknown; the seller reviews and edits inventory explicitly. Multi-quantity paid lines decrement by the reported quantity, and unknown SKUs/listing IDs are retained and counted for manual resolution.
 # Two-channel purchase operations
 
+## Authority and independent lifecycles
+
+Authority is deliberately split rather than inferred from whichever page was
+visited last:
+
+* the local SQLite item row is the authority for inventory, storefront
+  visibility, reservations, and the application's checkout workflow;
+* immutable server-side order snapshots are the authority for the amount,
+  currency, quantity, item identity, and shipping details submitted to Stripe;
+  browser fields and the success redirect are never payment evidence;
+* Stripe's signed webhooks and explicit API reads are the authority for
+  authorization, capture, cancellation, and refund outcomes; and
+* eBay remains the authority for its listing and order state. Local eBay
+  identifiers and reconciliation records make those remote operations
+  retryable, but do not turn SQLite into the marketplace authority.
+
+Checkout/payment, fulfillment, and refunds are separate lifecycles. A captured
+sale starts fulfillment at `unfulfilled`; seller actions move it forward through
+`packing`, `shipped`, and `delivered`. The customer-facing display progression is
+**Paid → Packing → Shipped → Delivered**. Refund state independently moves through
+`none`, `pending`, `refunded`, or `manual_resolution`; neither shipping nor a
+refund rewrites the historical fact that payment was captured.
+
+Tracking is entered manually by the seller when marking an order shipped and
+corrections are retained in an audit history. Vintage Ops does not buy a label,
+call a carrier, validate tracking, poll delivery, or infer delivery from tracking;
+**Delivered is also a manual seller confirmation**. Treat both values as staff
+records, not carrier-backed proof.
+
+## Cancellation, refunds, and attention
+
+Before capture, cancellation means canceling/releasing the Stripe authorization
+and retaining the inventory reservation until the result is known. After capture,
+the payment cannot be “cancelled”: the seller must issue a refund. Vintage Ops
+supports only an exact **full refund** of the persisted captured amount and
+currency. Partial refunds are explicitly deferred and must not be approximated
+by changing a local amount.
+
+Issuing a refund after the order is `shipped` or `delivered` requires an additional
+seller confirmation because the item has left the business. A refund has no
+inventory or fulfillment side effects: cancellation/refund never automatically
+increases quantity, makes the item visible on the storefront, or relists it on
+eBay. Return condition and physical possession must be reviewed before the seller
+manually changes inventory or listings.
+
+An attention acknowledgement means only “a seller has seen this case.” It does
+not resolve the underlying operation and is not provider-backed evidence. A case
+is resolved only after the Stripe/eBay state has been safely established and the
+corresponding reconciliation action records that outcome.
+
+### Safe Stripe refund rechecks
+
+Use **Recheck known refund** only for a `pending` or `manual_resolution` refund
+that already has a persisted Stripe Refund ID. The recheck retrieves that exact
+Refund; it does not create another refund. Before acting, confirm in the Stripe
+Dashboard that the PaymentIntent, Refund ID, amount, currency, mode/account, and
+order metadata match the local order. Never paste or substitute an ID, retry the
+original refund button merely because a request timed out, or use a charge's
+aggregate refunded amount as proof of one full refund. Let signed refund webhooks
+converge normally. Identifier, amount, currency, status, or event-order
+contradictions must remain in `manual_resolution` for provider-backed review.
+
 The local `items` row remains canonical inventory. Website checkout first acquires
 an expiring SQLite reservation in a short `BEGIN IMMEDIATE` transaction, then
 creates Stripe Checkout only after commit. Checkout uses manual capture: the
@@ -142,6 +204,20 @@ case. Review cancellation, capture failure, eBay withdrawal failure, expiry,
 retry, and cross-channel conflict queues routinely; a redirect success page is
 never evidence of payment.
 
+Coordinate migration execution with a maintenance window, a named operator, and
+a verified database backup/restore plan; run migrations exactly once before the
+new application processes traffic. Terminate HTTPS at a reviewed proxy, use HTTPS
+for every public and webhook URL, and enable `SESSION_COOKIE_SECURE=true`. Restrict
+Stripe and eBay credentials to the required account, mode, scopes, and operational
+staff; keep secrets out of source control and rotate them under a documented
+procedure. Back up both SQLite and required uploaded media, test restores, monitor
+application/provider failures and queue age, and alert on stuck operations and
+attention cases. Routinely review Stripe and eBay webhook-delivery dashboards for
+non-2xx, delayed, disabled, or repeatedly retried deliveries and reconcile them
+against local deduplication/audit records. Production migration and live
+activation remain coordinated operational work, not an automatic application
+feature.
+
 ## Stripe sandbox checkout procedure
 
 1. Create or select a Stripe sandbox and obtain its `sk_test_` secret key.
@@ -157,6 +233,15 @@ never evidence of payment.
 5. Observe authorization, confirmed eBay withdrawal, capture, sold inventory,
    and the audit timeline in the authenticated `/orders` dashboard. Confirm the
    relevant deliveries in Stripe receive HTTP 200.
+6. Test refunds with a separate disposable captured order. From the seller order
+   page request the exact full refund, then use the Stripe Sandbox to exercise
+   `refund.created`, `refund.updated`, `refund.failed`, and `charge.refunded`
+   delivery/retry behavior. Confirm the listener receives HTTP 200, duplicate and
+   out-of-order events converge without creating another refund, exact successful
+   evidence reaches `refunded`, and mismatched/contradictory evidence opens
+   attention or `manual_resolution`. Use **Recheck known refund** only after a
+   Refund ID is stored, and verify that it reads that ID rather than issuing a new
+   refund.
 
 Migration `011_checkout_reliability.sql` preserves all prior rows and labels
 their provider `legacy_unknown`; identifiers such as `cs_test_` are never used
@@ -179,3 +264,17 @@ Checkout accepts cards only, uses manual capture, and collects email and a
 shipping address. Shipping fees and tax pricing remain unfinished: the total is
 only the server-side item-price snapshot. The Stripe SDK/API contract is pinned
 by `requirements.txt`; webhook fixtures must be reviewed when that pin changes.
+
+## Explicit non-goals
+
+The current scope intentionally excludes:
+
+* shipping-label purchase or generation;
+* carrier API integrations and automatic delivery detection;
+* calculated shipping and tax calculation/collection;
+* partial refunds and exchanges;
+* automatic restocking, storefront relisting, or eBay relisting;
+* customer accounts and customer/seller notifications;
+* multiple seller users, permissions, or seller roles;
+* automated deployment or production/live activation; and
+* a storefront redesign.
