@@ -250,6 +250,17 @@ def create_app(config=None, http=None, stripe_adapter=None):
         if claim != "claimed": return "",503
         try:
             obj=(event.get("data") or {}).get("object") or {}
+            normalized_refunds=refund_service.normalize_webhook(event_type,obj)
+            if normalized_refunds:
+                for refund in normalized_refunds:
+                    pi_id=refund.get("payment_intent")
+                    reference=refund.get("reference")
+                    order=db.find_order_by_stripe(payment_intent_id=pi_id) if pi_id else None
+                    if not order and reference: order=db.get_order(reference)
+                    # Metadata may locate an order, but only its already-persisted
+                    # PaymentIntent is trusted for the eventual exact match.
+                    if order: refund_service.reconcile(order,refund,actor="stripe_webhook")
+                db.finish_webhook(event_id); return "",200
             sid=obj.get("id") if event_type.startswith("checkout.session") else obj.get("checkout_session")
             metadata=obj.get("metadata") or {}; reference=obj.get("client_reference_id") or metadata.get("order")
             pi=obj.get("payment_intent") or (obj.get("id") if event_type.startswith("payment_intent") else None)
