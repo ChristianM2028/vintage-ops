@@ -10,7 +10,7 @@ from werkzeug.security import check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
 import requests
 from config import Config
-from db import Database, STATUSES
+from db import Database, STATUSES, SellerSetupError
 from integrations.ebay import EbayService, MockEbayAdapter, EbayError, SandboxSellerSetup, EbayMetadataService
 from integrations.ebay.aspects import parse_aspects, parse_conditions, validate_specifics
 from integrations.ebay.client import EbayClient
@@ -68,7 +68,8 @@ def create_app(config=None, http=None, stripe_adapter=None):
             item=db.update_item(item["id"],**values)
         if mode=="local_mock": return MockEbayAdapter(cfg,db),item
         if mode in ("ebay_sandbox","ebay_production"):
-            if any(not item.get(column) for column in SNAPSHOT_FIELDS.values()):
+            if any(not isinstance(item.get(column),str) or not item[column].strip()
+                   for column in SNAPSHOT_FIELDS.values()):
                 raise EbayError("classification_required","This item is missing its persisted eBay seller configuration")
             overrides={key:item[column] for key,column in SNAPSHOT_FIELDS.items()}
             overrides["environment"]="sandbox" if mode=="ebay_sandbox" else "production"
@@ -605,10 +606,10 @@ def create_app(config=None, http=None, stripe_adapter=None):
         try: oauth.access_token(); authenticated=True
         except EbayError: pass
         if request.method=="POST":
-            setup=db.get_seller_setup()
-            if not setup:
-                flash("Set up the Sandbox seller before listing an item.","error")
-                return render_template("sandbox.html",cfg=cfg,authenticated=authenticated,setup=None,values=request.form.to_dict(),submitted_specifics=submitted_specifics())
+            try: setup=db.require_complete_seller_setup()
+            except SellerSetupError:
+                flash("Set up one complete Sandbox seller configuration before listing an item.","error")
+                return render_template("sandbox.html",cfg=cfg,authenticated=authenticated,setup=db.get_seller_setup(),values=request.form.to_dict(),submitted_specifics=submitted_specifics())
             values=request.form.to_dict(); specifics,_,_,errors=validate_metadata_form(values)
             if errors:
                 for error in errors: flash(error,"error")
