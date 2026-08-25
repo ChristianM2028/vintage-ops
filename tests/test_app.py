@@ -62,3 +62,33 @@ def test_routes_resolve_persisted_real_snapshot_and_local_mock(tmp_path):
     for action in ("list-ebay","update-ebay","sync-ebay","delist-ebay"):
         assert local_client.post(f"/items/{local['id']}/{action}",data=csrf(local_client)).status_code==302
     assert no_http.calls==[] and b"Local mock" in local_client.get(f"/items/{local['id']}").data
+
+def test_sandbox_creation_persists_normalized_seller_snapshot(tmp_path):
+    cfg=Config(database_path=str(tmp_path/"sandbox-create.sqlite"),environment="sandbox",
+               marketplace_mock_mode=True,location_key="changed-global")
+    app=create_app(cfg); db=app.extensions["vintage_db"]
+    db.save_seller_setup(None,"  fulfill  "," pay "," return "," location "," EBAY_US ")
+    client=app.test_client()
+    response=client.post("/sandbox",data={**csrf(client),"title":"Coat","description":"D",
+        "price":"10","condition":"USED_EXCELLENT","category":"123","category_name":"",
+        "photo_url":"https://example.test/coat.jpg"})
+    assert response.status_code==302
+    item=db.inventory()[0]
+    assert [item[k] for k in ("ebay_merchant_location_key","ebay_fulfillment_policy_id",
+        "ebay_payment_policy_id","ebay_return_policy_id","ebay_marketplace_id")]==[
+        "location","fulfill","pay","return","EBAY_US"]
+    # A later global or setup change cannot mutate the item's saved configuration.
+    db.save_seller_setup(None,"new-f","new-p","new-r","new-location","EBAY_GB")
+    assert db.get_item(item["id"])["ebay_merchant_location_key"]=="location"
+
+def test_sandbox_creation_fails_closed_for_missing_or_incomplete_setup(tmp_path):
+    app=create_app(Config(database_path=str(tmp_path/"sandbox-closed.sqlite"),environment="sandbox",
+                          marketplace_mock_mode=True))
+    db=app.extensions["vintage_db"]; client=app.test_client()
+    data={**csrf(client),"title":"Coat","description":"D","price":"10","condition":"USED_EXCELLENT",
+          "category":"123","category_name":"","photo_url":"https://example.test/coat.jpg"}
+    assert client.post("/sandbox",data=data).status_code==200
+    assert db.inventory()==[]
+    db.save_seller_setup(None,"fulfill","   ","return","location","EBAY_US")
+    assert client.post("/sandbox",data=data).status_code==200
+    assert db.inventory()==[]

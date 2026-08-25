@@ -9,6 +9,9 @@ TRANSITIONS = {
 }
 def now(): return datetime.now(timezone.utc).isoformat()
 
+class SellerSetupError(RuntimeError):
+    """The active eBay seller setup cannot safely be snapshotted."""
+
 class Disposition(str):
     """Explicit claim result, while retaining compatibility with old bool callers."""
     def __bool__(self): return self == "claimed"
@@ -37,6 +40,21 @@ class Database:
         with self.connect() as con:
             row=con.execute("SELECT * FROM ebay_seller_setup WHERE id=1").fetchone()
             return dict(row) if row else None
+    def require_complete_seller_setup(self):
+        """Return the sole seller setup with snapshot values normalized."""
+        fields=("merchant_location_key","fulfillment_policy_id","payment_policy_id",
+                "return_policy_id","marketplace")
+        with self.connect() as con:
+            rows=con.execute("SELECT * FROM ebay_seller_setup").fetchall()
+        if len(rows) != 1:
+            raise SellerSetupError("Exactly one active Sandbox seller setup is required.")
+        setup=dict(rows[0])
+        normalized={field:(setup.get(field).strip() if isinstance(setup.get(field),str) else None)
+                    for field in fields}
+        if any(not normalized[field] for field in fields):
+            raise SellerSetupError("The active Sandbox seller setup is incomplete.")
+        setup.update(normalized)
+        return setup
     def save_seller_setup(self, seller_id, fulfillment_policy_id, payment_policy_id,
                           return_policy_id, merchant_location_key, marketplace):
         stamp=now()
