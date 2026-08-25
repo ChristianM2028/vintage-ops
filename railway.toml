@@ -15,3 +15,8 @@ BACKUP_DIRECTORY = "/data/backups"
 EBAY_ENVIRONMENT = "sandbox"
 PROXY_FIX_PROTO = "1"
 PROXY_FIX_HOST = "1"
+
+# The daily backup caller is a separate Railway cron service (15 3 * * *).
+# It runs scripts/run_scheduled_backup.py without a volume. Bucket credentials
+# and BACKUP_ENCRYPTION_KEY belong only to this web service and are configured
+# as private Railway variables, never committed here.
