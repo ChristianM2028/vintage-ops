@@ -53,6 +53,12 @@ class Config:
     stripe_cancel_url: str = os.getenv("STRIPE_CANCEL_URL", "http://127.0.0.1:5000/shop/order/{ORDER_ID}/cancel")
     stripe_fake_mode: bool = env_bool("STRIPE_FAKE_MODE", True)
     reservation_seconds: int = int(os.getenv("STOREFRONT_RESERVATION_SECONDS", "1800"))
+    scheduled_job_token: str = os.getenv("SCHEDULED_JOB_TOKEN", "")
+    scheduled_job_lease_seconds: int = int(os.getenv("SCHEDULED_JOB_LEASE_SECONDS", "240"))
+    scheduled_job_limit: int = int(os.getenv("SCHEDULED_JOB_LIMIT", "100"))
+    ebay_order_page_size: int = int(os.getenv("EBAY_ORDER_PAGE_SIZE", "50"))
+    ebay_order_max_pages: int = int(os.getenv("EBAY_ORDER_MAX_PAGES", "10"))
+    ebay_order_max_orders: int = int(os.getenv("EBAY_ORDER_MAX_ORDERS", "500"))
     business_name: str = os.getenv("BUSINESS_NAME", "Vintage Ops")
     business_address: str = os.getenv("BUSINESS_ADDRESS", "")
     stripe_shipping_countries: tuple = tuple(
@@ -72,3 +78,9 @@ class Config:
             raise ValueError("Proxy trust values must be 0 or 1")
         if self.ebay_image_upload_api not in ("media", "trading"):
             raise ValueError("EBAY_IMAGE_UPLOAD_API must be media or trading")
+        if not 1 <= self.scheduled_job_limit <= 500 or not 30 <= self.scheduled_job_lease_seconds <= 3600:
+            raise ValueError("Scheduled-job bounds are invalid")
+        if not 1 <= self.ebay_order_page_size <= 200 or not 1 <= self.ebay_order_max_pages <= 100 or not 1 <= self.ebay_order_max_orders <= 5000:
+            raise ValueError("eBay order-fetch bounds are invalid")
+        if os.getenv("RAILWAY_ENVIRONMENT") and len(self.scheduled_job_token) < 32:
+            raise ValueError("SCHEDULED_JOB_TOKEN must be a high-entropy value in hosted environments")
