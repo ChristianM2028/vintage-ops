@@ -2,6 +2,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from werkzeug.security import generate_password_hash
 
 from app import create_app
 from config import Config
@@ -164,3 +165,110 @@ def test_fake_stripe_unknown_session_is_safely_classified():
         "message": "Checkout session was not found",
         "ambiguous": False,
     }
+
+
+def test_seller_can_correct_tracking_only_after_shipment(tmp_path):
+    app, db, _ = setup_store(
+        tmp_path, seller_username="seller",
+        seller_password_hash=generate_password_hash("correct horse battery staple"))
+    shopper, public_id = start_checkout(app)
+    assert shopper.post(f"/shop/order/{public_id}/complete", data=csrf(shopper)).status_code == 303
+
+    seller = app.test_client()
+    login = seller.get("/login")
+    login_token = login.text.split('name="csrf_token" value="', 1)[1].split('"', 1)[0]
+    assert seller.post("/login", data={
+        "csrf_token": login_token, "username": "seller",
+        "password": "correct horse battery staple",
+    }).status_code == 302
+    with seller.session_transaction() as session:
+        seller_token = session["csrf_token"]
+
+    detail_url = f"/orders/{public_id}"
+    correction_url = f"{detail_url}/tracking/correct"
+    assert f'action="{correction_url}"'.encode() not in seller.get(detail_url).data
+
+    fulfillment = app.extensions["fulfillment_service"]
+    fulfillment.mark_shipped(public_id, "UPS", "OLD-123", "ship-request")
+    shipped = seller.get(detail_url)
+    assert f'action="{correction_url}"'.encode() in shipped.data
+    assert b'name="carrier" value="UPS"' in shipped.data
+    assert b'name="tracking_number" value="OLD-123"' in shipped.data
+    assert b'name="reason" required' in shipped.data
+
+    corrected = seller.post(correction_url, data={
+        "csrf_token": seller_token, "request_token": "correction-request",
+        "carrier": "USPS", "tracking_number": "NEW-456",
+        "reason": "Customer reported a transposed digit",
+    })
+    assert corrected.status_code == 303
+    assert corrected.headers["Location"] == detail_url
+    active = db.get_order(public_id)
+    assert (active["tracking_carrier"], active["tracking_number"]) == ("USPS", "NEW-456")
+    revision = db.seller_order(public_id)["tracking_revisions"][-1]
+    assert (revision["previous_carrier"], revision["previous_tracking_number"]) == ("UPS", "OLD-123")
+    assert revision["correction_reason"] == "Customer reported a transposed digit"
+    history = seller.get(detail_url).data
+    assert b"NEW-456" in history and b"Customer reported a transposed digit" in history
+
+    invalid = seller.post(correction_url, data={
+        "csrf_token": seller_token, "request_token": "invalid-correction",
+        "carrier": "FedEx", "tracking_number": "BAD-789", "reason": "",
+    })
+    assert invalid.status_code == 409
+    assert (db.get_order(public_id)["tracking_carrier"],
+            db.get_order(public_id)["tracking_number"]) == ("USPS", "NEW-456")
+
+    fulfillment.mark_delivered(public_id, "delivery-request")
+    assert f'action="{correction_url}"'.encode() in seller.get(detail_url).data
+
+
+@pytest.mark.parametrize(
+    ("fulfillment_state", "current_label"),
+    (("unfulfilled", "Paid"), ("packing", "Packing"),
+     ("shipped", "Shipped"), ("delivered", "Delivered")),
+)
+def test_public_fulfillment_progress_tracking_and_projection(
+        tmp_path, fulfillment_state, current_label):
+    app, db, _ = setup_store(tmp_path)
+    client, public_id = start_checkout(app)
+    assert client.post(f"/shop/order/{public_id}/complete", data=csrf(client)).status_code == 303
+    with db.transaction() as con:
+        con.execute("""UPDATE storefront_orders SET fulfillment_state=?,
+            tracking_carrier='Secret Carrier',tracking_number='TRACK-123',
+            tracking_url='https://tracking.example.test/TRACK-123',
+            customer_email='private@example.test',shipping_line1='1 Private Road',
+            stripe_checkout_session_id='cs_provider_secret'
+            WHERE public_id=?""", (fulfillment_state, public_id))
+        order_id = con.execute("SELECT id FROM storefront_orders WHERE public_id=?",
+                               (public_id,)).fetchone()[0]
+        con.execute("""INSERT INTO storefront_order_notes(order_id,note,actor,created_at)
+            VALUES(?,?,?,?)""", (order_id, "private note", "seller", "2026-01-01"))
+
+    public_projection = db.public_order_status(public_id)
+    forbidden = {"customer_email", "shipping_line1", "stripe_checkout_session_id",
+                 "events", "notes", "tracking_revisions"}
+    assert forbidden.isdisjoint(public_projection)
+    page = client.get(f"/shop/order/{public_id}")
+    assert page.status_code == 200
+    assert f"<strong>{current_label}</strong> — Current stage".encode() in page.data
+    for secret in (b"private@example.test", b"1 Private Road", b"cs_provider_secret",
+                   b"private note", b"audit history"):
+        assert secret not in page.data
+    if fulfillment_state in ("shipped", "delivered"):
+        assert b"TRACK-123" in page.data
+        assert b'rel="noreferrer noopener"' in page.data
+    else:
+        assert b"TRACK-123" not in page.data
+
+
+def test_unconfirmed_payment_never_displays_fulfillment_progress(tmp_path):
+    app, db, _ = setup_store(tmp_path)
+    client, public_id = start_checkout(app)
+    with db.transaction() as con:
+        con.execute("UPDATE storefront_orders SET fulfillment_state='shipped' WHERE public_id=?",
+                    (public_id,))
+    page = client.get(f"/shop/order/{public_id}")
+    assert b"Processing" in page.data
+    assert b"Order fulfillment progress" not in page.data
+    assert b"Current stage" not in page.data
