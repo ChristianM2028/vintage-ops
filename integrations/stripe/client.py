@@ -44,6 +44,32 @@ class StripeAdapter:
         if not payment_intent_id: raise StripeIntegrationError("missing_payment_intent","Payment authorization is not ready")
         try: return stripe.PaymentIntent.cancel(payment_intent_id,api_key=self.cfg.stripe_secret_key,idempotency_key=key)
         except Exception as exc: raise StripeIntegrationError("cancellation_error","Cancellation result requires review",ambiguous=True) from exc
+    @staticmethod
+    def _refund(result):
+        payment_intent=getattr(result,"payment_intent",None)
+        return {"id":getattr(result,"id",None),"payment_intent":getattr(payment_intent,"id",payment_intent),
+                "amount":getattr(result,"amount",None),"currency":str(getattr(result,"currency","")).upper(),
+                "status":getattr(result,"status",None)}
+    @staticmethod
+    def _refund_error(exc):
+        name=type(exc).__name__.lower(); status=getattr(exc,"http_status",None)
+        provider_id=getattr(getattr(exc,"error",None),"refund",None)
+        if name in ("invalidrequesterror","carderror","idempotencyerror") or status in (400,402,404):
+            return StripeIntegrationError("refund_rejected","Stripe rejected the refund",ambiguous=False,provider_id=provider_id)
+        return StripeIntegrationError("refund_ambiguous","Refund outcome requires reconciliation",ambiguous=True,provider_id=provider_id)
+    def create_full_refund(self, payment_intent_id, amount, currency, public_id):
+        import stripe
+        if not payment_intent_id: raise StripeIntegrationError("missing_payment_intent","PaymentIntent is not available")
+        try:
+            result=stripe.Refund.create(payment_intent=payment_intent_id,amount=amount,
+                api_key=self.cfg.stripe_secret_key,idempotency_key=f"refund:{public_id}:full:v1")
+            return self._refund(result)
+        except Exception as exc: raise self._refund_error(exc) from exc
+    def retrieve_refund(self, refund_id):
+        import stripe
+        if not refund_id: raise StripeIntegrationError("missing_refund","A known Refund ID is required",ambiguous=False)
+        try: return self._refund(stripe.Refund.retrieve(refund_id,api_key=self.cfg.stripe_secret_key))
+        except Exception as exc: raise self._refund_error(exc) from exc
     def verify_webhook(self, payload, signature):
         import stripe
         try: return stripe.Webhook.construct_event(payload,signature,self.cfg.stripe_webhook_secret)

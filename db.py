@@ -466,7 +466,9 @@ class Database:
             if row and row["state"]=="manual_resolution": return {"disposition":"manual_resolution","token":None,"order":dict(order),"operation":dict(row)}
             if row and row["state"]=="running" and row["lease_expires_at"] and row["lease_expires_at"]>stamp:
                 return {"disposition":"busy","token":None,"order":dict(order),"operation":dict(row)}
-            key={"ebay_withdrawal":"withdraw","stripe_capture":"capture","stripe_cancel":"cancel"}[operation_type]+":"+public_id
+            key={"ebay_withdrawal":"withdraw","stripe_capture":"capture","stripe_cancel":"cancel",
+                 "stripe_full_refund":"refund"}[operation_type]+":"+public_id
+            if operation_type=="stripe_full_refund": key=f"refund:{public_id}:full:v1"
             if row:
                 c.execute("UPDATE storefront_operations SET state='running',attempts=attempts+1,claim_token=?,lease_expires_at=?,error=NULL,updated_at=? WHERE id=?",(token,expiry,stamp,row["id"]))
             else:
@@ -484,6 +486,16 @@ class Database:
         with self.transaction(immediate=True) as c:
             changed=c.execute("UPDATE storefront_operations SET state=?,result=?,diagnostic=?,error=?,claim_token=NULL,lease_expires_at=NULL,updated_at=? WHERE order_id=(SELECT id FROM storefront_orders WHERE public_id=?) AND operation_type=? AND state='running' AND claim_token=?",("manual_resolution" if manual else "complete",result,diagnostic,diagnostic,now(),public_id,operation_type,token)).rowcount
             return Disposition("manual_resolution" if manual and changed else "already_complete" if changed else "superseded")
+    def fail_operation(self, public_id, operation_type, token, diagnostic):
+        """Release a confirmed failure for retry while retaining its audit row."""
+        with self.transaction(immediate=True) as c:
+            changed=c.execute("UPDATE storefront_operations SET state='failed',diagnostic=?,error=?,claim_token=NULL,lease_expires_at=NULL,updated_at=? WHERE order_id=(SELECT id FROM storefront_orders WHERE public_id=?) AND operation_type=? AND state='running' AND claim_token=?",(diagnostic,diagnostic,now(),public_id,operation_type,token)).rowcount
+            return Disposition("failed" if changed else "superseded")
+    def reconcile_operation_failure(self, public_id, operation_type, diagnostic):
+        """Record a provider-confirmed reconciliation failure without a lease."""
+        with self.transaction(immediate=True) as c:
+            changed=c.execute("UPDATE storefront_operations SET state='failed',diagnostic=?,error=?,claim_token=NULL,lease_expires_at=NULL,updated_at=? WHERE order_id=(SELECT id FROM storefront_orders WHERE public_id=?) AND operation_type=?",(diagnostic,diagnostic,now(),public_id,operation_type)).rowcount
+            return Disposition("failed" if changed else "superseded")
     def finalize_storefront_sale(self,public_id,source="stripe_webhook"):
         with self.transaction(immediate=True) as c:
             order=c.execute("SELECT * FROM storefront_orders WHERE public_id=?",(public_id,)).fetchone()

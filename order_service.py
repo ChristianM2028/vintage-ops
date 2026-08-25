@@ -119,6 +119,12 @@ class OrderService:
             result = self.stripe.capture(order["stripe_payment_intent_id"], f"capture:{order['public_id']}")
             if _value(result, "status") != "succeeded":
                 raise StripeIntegrationError("capture_ambiguous", "Capture requires review", ambiguous=True)
+            amount=_value(result,"amount_received"); currency=_value(result,"currency")
+            # Stripe supplies these on a captured PaymentIntent. Legacy/custom
+            # test adapters may omit them; such orders remain intentionally
+            # ineligible for refund rather than inferring money from the form.
+            if isinstance(amount,int) and not isinstance(amount,bool) and currency:
+                self.db.record_provider_capture(order["public_id"],amount,currency)
             self.db.complete_operation(order["public_id"],"stripe_capture",capture["token"],result="captured")
             self.db.transition_order(order["public_id"], "paid", payment_state="captured", source=source, category="capture_confirmed")
             return self.db.finalize_storefront_sale(order["public_id"], source=source)
@@ -128,6 +134,8 @@ class OrderService:
 
     def _cancel_and_release(self, public_id, terminal, reason, source):
         order = self.db.get_order(public_id)
+        if order.get("payment_state")=="captured" or order.get("state") in ("paid","sold"):
+            raise ValueError("Captured PaymentIntents cannot be cancelled")
         if not order.get("stripe_payment_intent_id"):
             return self.db.transition_order(public_id, "manual_resolution", error='{"kind":"missing_payment_intent","message":"Cancellation requires review","ambiguous":true}', source=source, category="cancellation_ambiguous")
         claim=self.db.claim_operation(public_id,"stripe_cancel")

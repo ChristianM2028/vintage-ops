@@ -3,11 +3,13 @@ from .errors import StripeIntegrationError
 
 class FakeStripeAdapter:
     identity = "fake"
-    def __init__(self, config): self.cfg=config; self.sessions={}; self.captures=[]; self.cancellations=[]; self.calls=[]
+    def __init__(self, config): self.cfg=config; self.sessions={}; self.captures=[]; self.cancellations=[]; self.calls=[]; self.payment_intents={}; self.refunds={}; self.refund_keys={}; self.refund_mode="succeeded"; self.refund_calls=[]
     def create_checkout(self, order, item, success_url, cancel_url):
         self.calls.append({"order":order["public_id"],"amount":order["price_snapshot"],"currency":order["currency_snapshot"],"quantity":1,"name":item["title"]})
         sid="cs_test_"+order["public_id"][:16]; pi="pi_test_"+order["public_id"][:16]
-        result={"id":sid,"payment_intent":pi,"url":f"/shop/order/{order['public_id']}"}; self.sessions[sid]=result; return result
+        result={"id":sid,"payment_intent":pi,"url":f"/shop/order/{order['public_id']}"}; self.sessions[sid]=result
+        self.payment_intents[pi]={"amount_received":int(round(float(order["price_snapshot"])*100)),"currency":order["currency_snapshot"].lower()}
+        return result
     def retrieve_session(self,session_id):
         session=self.sessions.get(session_id)
         if session is None:
@@ -15,10 +17,27 @@ class FakeStripeAdapter:
         return session
     def capture(self,payment_intent_id,key):
         if key not in [x[1] for x in self.captures]: self.captures.append((payment_intent_id,key))
-        return {"id":payment_intent_id,"status":"succeeded"}
+        return {"id":payment_intent_id,"status":"succeeded",**self.payment_intents.get(payment_intent_id,{})}
     def cancel(self,payment_intent_id,key):
         if key not in [x[1] for x in self.cancellations]: self.cancellations.append((payment_intent_id,key))
         return {"id":payment_intent_id,"status":"canceled"}
+    def create_full_refund(self,payment_intent_id,amount,currency,public_id):
+        key=f"refund:{public_id}:full:v1"
+        if key in self.refund_keys: return dict(self.refunds[self.refund_keys[key]])
+        self.refund_calls.append((payment_intent_id,amount,currency,key))
+        if self.refund_mode=="failed": raise StripeIntegrationError("refund_rejected","Stripe rejected the refund",ambiguous=False)
+        rid="re_test_"+public_id[:16]
+        result={"id":rid,"payment_intent":payment_intent_id,"amount":amount,"currency":currency.upper(),
+                "status":"pending" if self.refund_mode in ("pending","ambiguous") else "succeeded"}
+        self.refunds[rid]=result; self.refund_keys[key]=rid
+        if self.refund_mode=="ambiguous": raise StripeIntegrationError("refund_ambiguous","Refund outcome requires reconciliation",ambiguous=True,provider_id=rid)
+        return dict(result)
+    def retrieve_refund(self,refund_id):
+        if self.refund_mode=="ambiguous": raise StripeIntegrationError("refund_ambiguous","Refund retrieval requires review",ambiguous=True,provider_id=refund_id)
+        if refund_id not in self.refunds: raise StripeIntegrationError("refund_rejected","Refund was not found",ambiguous=False)
+        result=dict(self.refunds[refund_id])
+        if self.refund_mode in ("succeeded","pending","failed"): result["status"]=self.refund_mode
+        return result
     def verify_webhook(self,payload,signature):
         expected=hmac.new(self.cfg.stripe_webhook_secret.encode(),payload,hashlib.sha256).hexdigest()
         if not hmac.compare_digest(expected,signature or ""): raise StripeIntegrationError("invalid_signature","Invalid webhook signature")

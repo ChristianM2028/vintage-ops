@@ -17,6 +17,7 @@ from integrations.ebay.photos import EbayImagePublisher
 from integrations.stripe import StripeAdapter, FakeStripeAdapter, StripeIntegrationError
 from order_service import OrderService
 from fulfillment_service import FulfillmentService, FulfillmentError
+from refund_service import RefundService, RefundError
 
 IMAGE_SIGNATURES={"jpg":lambda b:b.startswith(b"\xff\xd8\xff"),"jpeg":lambda b:b.startswith(b"\xff\xd8\xff"),"png":lambda b:b.startswith(b"\x89PNG\r\n\x1a\n"),"gif":lambda b:b.startswith((b"GIF87a",b"GIF89a")),"webp":lambda b:len(b)>=12 and b[:4]==b"RIFF" and b[8:12]==b"WEBP"}
 
@@ -65,6 +66,7 @@ def create_app(config=None, http=None, stripe_adapter=None):
         raise EbayError("classification_required","Choose an eBay integration mode before operating on this item")
     order_service=OrderService(db,stripe_gateway,resolve_ebay,cfg)
     fulfillment_service=FulfillmentService(db)
+    refund_service=RefundService(db,stripe_gateway)
     def adapters():
         return {"ebay": MockEbayAdapter(cfg,db) if cfg.marketplace_mock_mode else real_components()[1]}
     def item_or_404(item_id): return db.get_item(item_id) or abort(404)
@@ -82,7 +84,7 @@ def create_app(config=None, http=None, stripe_adapter=None):
     def seller_guard():
         # Order fulfillment data is never public, even on an incompletely
         # configured development install where the legacy seller UI is open.
-        always_protected={"orders","order_detail","seller_cancel_order","seller_retry_order","mark_packing","mark_shipped","correct_tracking","mark_delivered","add_order_note","acknowledge_attention"}
+        always_protected={"orders","order_detail","seller_cancel_order","seller_retry_order","seller_refund_order","seller_recheck_refund","mark_packing","mark_shipped","correct_tracking","mark_delivered","add_order_note","acknowledge_attention"}
         if request.endpoint not in always_protected and (not cfg.seller_username or not cfg.seller_password_hash): return
         if request.endpoint in public_endpoints: return
         if not session.get("seller_authenticated"):
@@ -346,6 +348,20 @@ def create_app(config=None, http=None, stripe_adapter=None):
         try: order_service.retry(public_id)
         except ValueError: abort(409,"Order cannot be retried")
         return redirect(url_for("order_detail",public_id=public_id),code=303)
+    @app.post("/orders/<public_id>/refund")
+    def seller_refund_order(public_id):
+        confirmed(); order=db.get_order(public_id) or abort(404)
+        if order["fulfillment_state"] in ("shipped","delivered") and request.form.get("fulfillment_confirmation")!="CONFIRM":
+            abort(400,"Confirm the shipped or delivered refund warning")
+        try: refund_service.create_full(public_id)
+        except RefundError as exc: abort(409,str(exc))
+        return redirect(url_for("order_detail",public_id=public_id),code=303)
+    @app.post("/orders/<public_id>/refund/recheck")
+    def seller_recheck_refund(public_id):
+        confirmed()
+        try: refund_service.recheck(public_id)
+        except RefundError as exc: abort(409,str(exc))
+        return redirect(url_for("order_detail",public_id=public_id),code=303)
 
     @app.post("/maintenance/storefront")
     def storefront_maintenance():
@@ -530,7 +546,7 @@ def create_app(config=None, http=None, stripe_adapter=None):
         except EbayError as error:
             flash(json.dumps(error.safe_dict()),"error")
         return redirect(url_for("sandbox"))
-    app.extensions.update(vintage_db=db,stripe_adapter=stripe_gateway,order_service=order_service,fulfillment_service=fulfillment_service,ebay_components=real_components,ebay_metadata=metadata_component(),ebay_metadata_factory=metadata_component,marketplace_adapters=adapters)
+    app.extensions.update(vintage_db=db,stripe_adapter=stripe_gateway,order_service=order_service,fulfillment_service=fulfillment_service,refund_service=refund_service,ebay_components=real_components,ebay_metadata=metadata_component(),ebay_metadata_factory=metadata_component,marketplace_adapters=adapters)
     return app
 
 if __name__ == "__main__":
