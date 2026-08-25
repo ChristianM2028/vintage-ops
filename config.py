@@ -1,6 +1,7 @@
-import os, re
+import base64, os, re
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
@@ -36,6 +37,16 @@ class Config:
     marketplace_mock_mode: bool = env_bool("MARKETPLACE_MOCK_MODE", True)
     upload_directory: str = os.getenv("UPLOAD_DIRECTORY", "instance/uploads")
     backup_directory: str = os.getenv("BACKUP_DIRECTORY", "instance/backups")
+    backup_encryption_key: str = os.getenv("BACKUP_ENCRYPTION_KEY", "")
+    backup_s3_endpoint: str = os.getenv("BACKUP_S3_ENDPOINT", "")
+    backup_s3_region: str = os.getenv("BACKUP_S3_REGION", "")
+    backup_s3_bucket: str = os.getenv("BACKUP_S3_BUCKET", "")
+    backup_s3_access_key_id: str = os.getenv("BACKUP_S3_ACCESS_KEY_ID", "")
+    backup_s3_secret_access_key: str = os.getenv("BACKUP_S3_SECRET_ACCESS_KEY", "")
+    backup_s3_prefix: str = os.getenv("BACKUP_S3_PREFIX", "vintage-ops/backups").strip(" /")
+    backup_daily_retention: int = int(os.getenv("BACKUP_DAILY_RETENTION", "7"))
+    backup_weekly_retention: int = int(os.getenv("BACKUP_WEEKLY_RETENTION", "4"))
+    backup_scheduled_job_token: str = os.getenv("BACKUP_SCHEDULED_JOB_TOKEN", "")
     max_upload_size: int = int(os.getenv("MAX_UPLOAD_SIZE", str(8 * 1024 * 1024)))
     permitted_image_extensions: tuple = tuple(x.strip().lower().lstrip(".") for x in os.getenv("PERMITTED_IMAGE_EXTENSIONS", "jpg,jpeg,png,gif,webp").split(",") if x.strip())
     max_photo_count: int = int(os.getenv("MAX_PHOTO_COUNT", "10"))
@@ -85,3 +96,29 @@ class Config:
             raise ValueError("eBay order-fetch bounds are invalid")
         if os.getenv("RAILWAY_ENVIRONMENT") and len(self.scheduled_job_token) < 32:
             raise ValueError("SCHEDULED_JOB_TOKEN must be a high-entropy value in hosted environments")
+        if (not self.backup_s3_prefix or any(part in {"", ".", ".."} for part in self.backup_s3_prefix.split("/"))
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*",self.backup_s3_prefix)):
+            raise ValueError("BACKUP_S3_PREFIX must be a non-empty normalized prefix")
+        if not 1 <= self.backup_daily_retention <= 31 or not 1 <= self.backup_weekly_retention <= 52:
+            raise ValueError("Backup retention bounds are invalid")
+        hosted = bool(os.getenv("RAILWAY_ENVIRONMENT"))
+        backup_values = (self.backup_encryption_key, self.backup_s3_endpoint,
+                         self.backup_s3_region, self.backup_s3_bucket,
+                         self.backup_s3_access_key_id, self.backup_s3_secret_access_key,
+                         self.backup_scheduled_job_token)
+        if hosted and any(not value for value in backup_values):
+            raise ValueError("Hosted backup configuration is incomplete")
+        endpoint=urlsplit(self.backup_s3_endpoint)
+        if self.backup_s3_endpoint and (endpoint.scheme!="https" or not endpoint.netloc or endpoint.username or endpoint.password):
+            raise ValueError("BACKUP_S3_ENDPOINT must use HTTPS")
+        if self.backup_encryption_key:
+            try:
+                if not re.fullmatch(r"[A-Za-z0-9_-]{43}=",self.backup_encryption_key):
+                    raise ValueError
+                key = base64.urlsafe_b64decode(self.backup_encryption_key.encode("ascii"))
+            except Exception as exc:
+                raise ValueError("BACKUP_ENCRYPTION_KEY must be URL-safe base64") from exc
+            if len(key) != 32:
+                raise ValueError("BACKUP_ENCRYPTION_KEY must encode exactly 32 bytes")
+        if hosted and len(self.backup_scheduled_job_token) < 32:
+            raise ValueError("BACKUP_SCHEDULED_JOB_TOKEN must be a high-entropy value in hosted environments")

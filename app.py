@@ -11,6 +11,8 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 import requests
 from config import Config
 from backups import BackupError, create_backup, prune_backups
+from backup_storage import (BackupStorageError, SAFE_SUMMARY, orchestrate_backup,
+                            restore_backup)
 from db import Database, STATUSES, SellerSetupError
 from integrations.ebay import EbayService, MockEbayAdapter, EbayError, SandboxSellerSetup, EbayMetadataService
 from integrations.ebay.aspects import parse_aspects, parse_conditions, validate_specifics
@@ -92,9 +94,9 @@ def create_app(config=None, http=None, stripe_adapter=None):
     @app.before_request
     def csrf_protect():
         expected=session.get("csrf_token")
-        if request.method=="POST" and request.endpoint not in {"stripe_webhook","scheduled_maintenance"} and (not expected or not secrets.compare_digest(expected, request.form.get("csrf_token", ""))): abort(400,"Invalid CSRF token")
+        if request.method=="POST" and request.endpoint not in {"stripe_webhook","scheduled_maintenance","scheduled_backup"} and (not expected or not secrets.compare_digest(expected, request.form.get("csrf_token", ""))): abort(400,"Invalid CSRF token")
 
-    public_endpoints={"healthz","shop","shop_item","media","checkout","order_status","order_success","order_cancel","fake_complete_order","fake_cancel_order","stripe_webhook","scheduled_maintenance","static","login"}
+    public_endpoints={"healthz","shop","shop_item","media","checkout","order_status","order_success","order_cancel","fake_complete_order","fake_cancel_order","stripe_webhook","scheduled_maintenance","scheduled_backup","static","login"}
     @app.before_request
     def seller_guard():
         # Order fulfillment data is never public, even on an incompletely
@@ -117,6 +119,29 @@ def create_app(config=None, http=None, stripe_adapter=None):
         ebay=None if cfg.marketplace_mock_mode else adapters()["ebay"]
         result=run_scheduled_job(db,ebay,limit=cfg.scheduled_job_limit,lease_seconds=cfg.scheduled_job_lease_seconds)
         return jsonify(result), (200 if result["status"]=="ok" else 409 if result["status"]=="busy" else 502)
+
+    @app.post("/internal/scheduled-backup")
+    def scheduled_backup():
+        supplied=request.headers.get("Authorization","")
+        expected="Bearer "+cfg.backup_scheduled_job_token if cfg.backup_scheduled_job_token else ""
+        if not expected or not supplied.startswith("Bearer ") or not secrets.compare_digest(supplied,expected):
+            return jsonify({"status":"unauthorized"}),401
+        claim=db.acquire_scheduled_job("daily-remote-backup",cfg.scheduled_job_lease_seconds)
+        if claim["disposition"]=="busy": return jsonify({"status":"busy"}),409
+        token=claim["ownership_token"]
+        try:
+            result=orchestrate_backup(cfg,db)
+            db.finish_scheduled_job("daily-remote-backup",token,True,result)
+            return jsonify({key:result[key] for key in SAFE_SUMMARY}),200
+        except BackupError as exc:
+            message=str(exc).lower()
+            category=("verification" if "verif" in message or "checksum" in message else
+                      "retention" if "retention" in message else
+                      "upload" if "upload" in message or "remote" in message else "configuration")
+            result={"status":category}
+            db.finish_scheduled_job("daily-remote-backup",token,False,result)
+            app.logger.error("Scheduled backup failed: %s",type(exc).__name__)
+            return jsonify(result),502 if category!="configuration" else 503
 
     @app.route("/login",methods=["GET","POST"])
     def login():
@@ -650,6 +675,16 @@ def create_app(config=None, http=None, stripe_adapter=None):
         for name in removed:
             click.echo(name)
         click.echo(f"count={len(removed)} dry_run={'true' if dry_run else 'false'}")
+    @app.cli.command("restore-backup")
+    @click.option("--object-key",required=True)
+    @click.option("--destination",required=True,type=click.Path(path_type=Path))
+    def restore_backup_cli(object_key,destination):
+        """Validate and extract a remote backup into a new, explicit directory."""
+        try: result=restore_backup(cfg,object_key,destination)
+        except BackupStorageError as exc:
+            app.logger.error("Backup restore failed: %s",type(exc).__name__)
+            raise click.ClickException(str(exc)) from exc
+        click.echo(json.dumps({"status":result["status"]},sort_keys=True))
     @app.route("/sandbox",methods=["GET","POST"])
     def sandbox():
         if cfg.environment != "sandbox": abort(404)

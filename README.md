@@ -439,3 +439,52 @@ The current scope intentionally excludes:
 * multiple seller users, permissions, or seller roles;
 * automated deployment or production/live activation; and
 * a storefront redesign.
+
+## Daily encrypted Railway backups
+
+The **web service is the only service that mounts `/data`** and owns SQLite,
+uploaded photos, backup creation, encryption, and private-bucket access. Configure
+these placeholder-named variables on that service only:
+
+* `BACKUP_S3_ENDPOINT=https://<railway-bucket-endpoint>`
+* `BACKUP_S3_REGION=<bucket-region>` and `BACKUP_S3_BUCKET=<private-bucket-name>`
+* `BACKUP_S3_ACCESS_KEY_ID=<access-key>` and `BACKUP_S3_SECRET_ACCESS_KEY=<secret-key>`
+* `BACKUP_S3_PREFIX=vintage-ops/backups`
+* `BACKUP_ENCRYPTION_KEY=<URL-safe-base64-encoded-random-32-byte-key>`
+* `BACKUP_SCHEDULED_JOB_TOKEN=<independent-high-entropy-token>`
+
+`BACKUP_ENCRYPTION_KEY` is deliberately independent of `TOKEN_ENCRYPTION_KEY`.
+Retain old encryption keys while their backups remain restorable; rotation does
+not re-encrypt existing objects.
+
+Create a separate Railway cron service scheduled once daily at **03:15 UTC**
+(`15 3 * * *`) with start command `python scripts/run_scheduled_backup.py`. Give
+it only `BACKUP_JOB_URL=https://<web-service>/internal/scheduled-backup` and the
+matching `BACKUP_SCHEDULED_JOB_TOKEN`. It must have no volume, database settings,
+or bucket credentials. This is separate from the frequent scheduled-maintenance
+cron above.
+
+The web endpoint uses a database lease and one canonical UTC-date object key, so
+retries are bounded and idempotent. It encrypts only a completed, integrity-
+checked archive, verifies authoritative object size and application SHA-256
+metadata after upload, then removes local temporary archives. Failed verification
+preserves restrictive local diagnostics and returns non-2xx. Remote retention
+keeps the newest generation for 7 distinct UTC days plus one for each of the 4
+most recent UTC ISO weeks; only recognized keys below the application prefix can
+be deleted. Alert on nonzero cron exits, non-2xx responses, missed daily runs,
+and retention or verification failures.
+
+Restoration is deliberately offline and never in place. On a trusted
+non-production worker configured with bucket credentials and the historical
+backup key, run:
+
+```sh
+flask --app 'app:create_app()' restore-backup \
+  --object-key vintage-ops/backups/vintage-ops-YYYY-MM-DD.tar.gz.enc \
+  --destination /safe/empty/restore-directory
+```
+
+The command verifies the encrypted download, authenticates it, validates every
+archive member, manifest/photo inventory, and SQLite integrity, then atomically
+publishes the destination. Review the output and perform any production change
+manually; the command never restarts the app or overwrites `/data`.
