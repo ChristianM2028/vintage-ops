@@ -293,7 +293,7 @@ def create_app(config=None, http=None, stripe_adapter=None):
     def fake_development_mode(): return cfg.stripe_fake_mode and cfg.environment != "production"
     def render_order(public_id, **context):
         response=make_response(render_template("order_status.html",order=db.public_order_status(public_id) or abort(404),fake_development_mode=fake_development_mode(),**context))
-        response.headers.update({"Cache-Control":"no-store","X-Robots-Tag":"noindex, nofollow","Referrer-Policy":"no-referrer"})
+        response.headers.update({"Cache-Control":"private, no-store","X-Robots-Tag":"noindex, nofollow","Referrer-Policy":"no-referrer"})
         return response
     @app.get("/shop/order/<public_id>")
     def order_status(public_id): return render_order(public_id)
