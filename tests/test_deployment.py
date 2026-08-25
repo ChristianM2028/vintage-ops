@@ -26,6 +26,7 @@ def test_checked_in_launch_contract():
     railway=Path("railway.toml").read_text()
     assert 'DATABASE_PATH = "/data/vintage_ops.sqlite3"' in railway
     assert 'UPLOAD_DIRECTORY = "/data/uploads"' in railway
+    assert 'BACKUP_DIRECTORY = "/data/backups"' in railway
 
 
 def test_startup_uses_only_configured_persistent_paths(tmp_path, monkeypatch):

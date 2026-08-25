@@ -10,6 +10,7 @@ from werkzeug.security import check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
 import requests
 from config import Config
+from backups import BackupError, create_backup, prune_backups
 from db import Database, STATUSES, SellerSetupError
 from integrations.ebay import EbayService, MockEbayAdapter, EbayError, SandboxSellerSetup, EbayMetadataService
 from integrations.ebay.aspects import parse_aspects, parse_conditions, validate_specifics
@@ -614,6 +615,41 @@ def create_app(config=None, http=None, stripe_adapter=None):
         if summary["status"]!="ok": raise click.ClickException("eBay reconciliation failed")
         result={"processed":summary["orders_processed"],"duplicate":summary["duplicates"],"unknown":summary["unknown_items"]}
         click.echo(" ".join(f"{key}={result.get(key,0)}" for key in ("processed","duplicate","unknown")))
+    @app.cli.command("create-backup")
+    def create_backup_cli():
+        """Create a verified database and uploads backup."""
+        try:
+            # Resolve the database through the registered application component,
+            # rather than constructing an unrelated database configuration.
+            database = app.extensions["vintage_db"]
+            if Path(database.path).resolve() != Path(cfg.database_path).resolve():
+                raise BackupError("Registered database does not match configuration")
+            archive, summary = create_backup(
+                cfg.database_path, cfg.upload_directory, cfg.backup_directory
+            )
+        except (BackupError, OSError) as exc:
+            app.logger.error("Backup creation failed: %s", type(exc).__name__)
+            raise click.ClickException(str(exc) if isinstance(exc, BackupError) else "Backup creation failed") from exc
+        click.echo(str(archive))
+        click.echo(f"integrity={summary['integrity_check']} photos={summary['photo_count']}")
+
+    @app.cli.command("prune-backups")
+    @click.option("--keep-days", type=int)
+    @click.option("--keep-count", type=int)
+    @click.option("--dry-run", is_flag=True)
+    def prune_backups_cli(keep_days, keep_count, dry_run):
+        """Delete recognized archives according to one explicit retention rule."""
+        try:
+            removed = prune_backups(
+                cfg.backup_directory, keep_days=keep_days,
+                keep_count=keep_count, dry_run=dry_run,
+            )
+        except (BackupError, OSError) as exc:
+            app.logger.error("Backup pruning failed: %s", type(exc).__name__)
+            raise click.ClickException(str(exc) if isinstance(exc, BackupError) else "Backup pruning failed") from exc
+        for name in removed:
+            click.echo(name)
+        click.echo(f"count={len(removed)} dry_run={'true' if dry_run else 'false'}")
     @app.route("/sandbox",methods=["GET","POST"])
     def sandbox():
         if cfg.environment != "sandbox": abort(404)

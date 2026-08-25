@@ -35,6 +35,7 @@ class Config:
     timeout: float = float(os.getenv("EBAY_TIMEOUT_SECONDS", "15"))
     marketplace_mock_mode: bool = env_bool("MARKETPLACE_MOCK_MODE", True)
     upload_directory: str = os.getenv("UPLOAD_DIRECTORY", "instance/uploads")
+    backup_directory: str = os.getenv("BACKUP_DIRECTORY", "instance/backups")
     max_upload_size: int = int(os.getenv("MAX_UPLOAD_SIZE", str(8 * 1024 * 1024)))
     permitted_image_extensions: tuple = tuple(x.strip().lower().lstrip(".") for x in os.getenv("PERMITTED_IMAGE_EXTENSIONS", "jpg,jpeg,png,gif,webp").split(",") if x.strip())
     max_photo_count: int = int(os.getenv("MAX_PHOTO_COUNT", "10"))
