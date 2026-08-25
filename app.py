@@ -16,6 +16,7 @@ from integrations.ebay.oauth import OAuthManager
 from integrations.ebay.photos import EbayImagePublisher
 from integrations.stripe import StripeAdapter, FakeStripeAdapter, StripeIntegrationError
 from order_service import OrderService
+from fulfillment_service import FulfillmentService, FulfillmentError
 
 IMAGE_SIGNATURES={"jpg":lambda b:b.startswith(b"\xff\xd8\xff"),"jpeg":lambda b:b.startswith(b"\xff\xd8\xff"),"png":lambda b:b.startswith(b"\x89PNG\r\n\x1a\n"),"gif":lambda b:b.startswith((b"GIF87a",b"GIF89a")),"webp":lambda b:len(b)>=12 and b[:4]==b"RIFF" and b[8:12]==b"WEBP"}
 
@@ -63,6 +64,7 @@ def create_app(config=None, http=None, stripe_adapter=None):
             return real_components(overrides)[1],item
         raise EbayError("classification_required","Choose an eBay integration mode before operating on this item")
     order_service=OrderService(db,stripe_gateway,resolve_ebay,cfg)
+    fulfillment_service=FulfillmentService(db)
     def adapters():
         return {"ebay": MockEbayAdapter(cfg,db) if cfg.marketplace_mock_mode else real_components()[1]}
     def item_or_404(item_id): return db.get_item(item_id) or abort(404)
@@ -80,7 +82,7 @@ def create_app(config=None, http=None, stripe_adapter=None):
     def seller_guard():
         # Order fulfillment data is never public, even on an incompletely
         # configured development install where the legacy seller UI is open.
-        always_protected={"orders","order_detail","seller_cancel_order","seller_retry_order"}
+        always_protected={"orders","order_detail","seller_cancel_order","seller_retry_order","mark_packing","mark_shipped","correct_tracking","mark_delivered","add_order_note","acknowledge_attention"}
         if request.endpoint not in always_protected and (not cfg.seller_username or not cfg.seller_password_hash): return
         if request.endpoint in public_endpoints: return
         if not session.get("seller_authenticated"):
@@ -314,6 +316,22 @@ def create_app(config=None, http=None, stripe_adapter=None):
 
     @app.get("/orders/<public_id>")
     def order_detail(public_id): return render_template("order_detail.html",order=db.seller_order(public_id) or abort(404))
+    def fulfillment_action(call):
+        try: call()
+        except FulfillmentError as exc: abort(409,str(exc))
+        return redirect(url_for("order_detail",public_id=request.view_args["public_id"]),code=303)
+    @app.post("/orders/<public_id>/packing")
+    def mark_packing(public_id): return fulfillment_action(lambda: fulfillment_service.mark_packing(public_id,request.form.get("request_token")))
+    @app.post("/orders/<public_id>/ship")
+    def mark_shipped(public_id): return fulfillment_action(lambda: fulfillment_service.mark_shipped(public_id,request.form.get("carrier"),request.form.get("tracking_number"),request.form.get("request_token")))
+    @app.post("/orders/<public_id>/tracking/correct")
+    def correct_tracking(public_id): return fulfillment_action(lambda: fulfillment_service.correct_tracking(public_id,request.form.get("carrier"),request.form.get("tracking_number"),request.form.get("reason"),request.form.get("request_token")))
+    @app.post("/orders/<public_id>/delivered")
+    def mark_delivered(public_id): return fulfillment_action(lambda: fulfillment_service.mark_delivered(public_id,request.form.get("request_token")))
+    @app.post("/orders/<public_id>/notes")
+    def add_order_note(public_id): return fulfillment_action(lambda: fulfillment_service.add_note(public_id,request.form.get("note"),request.form.get("request_token")))
+    @app.post("/orders/<public_id>/attention/<int:case_id>/acknowledge")
+    def acknowledge_attention(public_id,case_id): return fulfillment_action(lambda: fulfillment_service.acknowledge_attention(public_id,case_id,request.form.get("request_token")))
     def confirmed():
         if request.form.get("confirmation") != "CONFIRM": abort(400,"Type CONFIRM to continue")
     @app.post("/orders/<public_id>/cancel")
@@ -512,7 +530,7 @@ def create_app(config=None, http=None, stripe_adapter=None):
         except EbayError as error:
             flash(json.dumps(error.safe_dict()),"error")
         return redirect(url_for("sandbox"))
-    app.extensions.update(vintage_db=db,stripe_adapter=stripe_gateway,order_service=order_service,ebay_components=real_components,ebay_metadata=metadata_component(),ebay_metadata_factory=metadata_component,marketplace_adapters=adapters)
+    app.extensions.update(vintage_db=db,stripe_adapter=stripe_gateway,order_service=order_service,fulfillment_service=fulfillment_service,ebay_components=real_components,ebay_metadata=metadata_component(),ebay_metadata_factory=metadata_component,marketplace_adapters=adapters)
     return app
 
 if __name__ == "__main__":
