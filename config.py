@@ -42,6 +42,8 @@ class Config:
     seller_username: str = os.getenv("SELLER_USERNAME", "")
     seller_password_hash: str = os.getenv("SELLER_PASSWORD_HASH", "")
     session_cookie_secure: bool = env_bool("SESSION_COOKIE_SECURE", False)
+    proxy_fix_proto: int = int(os.getenv("PROXY_FIX_PROTO", "0"))
+    proxy_fix_host: int = int(os.getenv("PROXY_FIX_HOST", "0"))
     stripe_secret_key: str = os.getenv("STRIPE_SECRET_KEY", "")
     stripe_webhook_secret: str = os.getenv("STRIPE_WEBHOOK_SECRET", "development-webhook-secret")
     stripe_success_url: str = os.getenv("STRIPE_SUCCESS_URL", "http://127.0.0.1:5000/shop/order/{ORDER_ID}/success")
@@ -63,3 +65,5 @@ class Config:
         if not self.stripe_shipping_countries or any(
                 not re.fullmatch(r"[A-Z]{2}", value) for value in self.stripe_shipping_countries):
             raise ValueError("Stripe shipping countries must be two-letter country codes")
+        if self.proxy_fix_proto not in (0, 1) or self.proxy_fix_host not in (0, 1):
+            raise ValueError("Proxy trust values must be 0 or 1")

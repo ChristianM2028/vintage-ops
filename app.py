@@ -1,4 +1,5 @@
 import json, logging, os, re, secrets
+import click
 from dataclasses import replace
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -6,6 +7,7 @@ from flask import Flask, abort, flash, jsonify, make_response, redirect, render_
 from functools import wraps
 from urllib.parse import urlsplit
 from werkzeug.security import check_password_hash
+from werkzeug.middleware.proxy_fix import ProxyFix
 import requests
 from config import Config
 from db import Database, STATUSES
@@ -24,7 +26,15 @@ IMAGE_SIGNATURES={"jpg":lambda b:b.startswith(b"\xff\xd8\xff"),"jpeg":lambda b:b
 
 def create_app(config=None, http=None, stripe_adapter=None):
     cfg=config or Config(); app=Flask(__name__); app.secret_key=cfg.secret_key
-    upload_dir=Path(cfg.upload_directory).resolve(); upload_dir.mkdir(parents=True,exist_ok=True)
+    upload_dir=Path(cfg.upload_directory).resolve(); database_path=Path(cfg.database_path).resolve()
+    database_path.parent.mkdir(parents=True,exist_ok=True); upload_dir.mkdir(parents=True,exist_ok=True)
+    if not upload_dir.is_dir(): raise RuntimeError("Configured upload path is not a directory")
+    def require_writable(path,label):
+        probe=path/f".vintage-ops-write-check-{os.getpid()}"
+        try: probe.write_text("",encoding="utf-8"); probe.unlink()
+        except OSError as exc: raise RuntimeError(f"Configured {label} is not writable") from exc
+    require_writable(upload_dir,"upload directory"); require_writable(database_path.parent,"database directory")
+    app.wsgi_app=ProxyFix(app.wsgi_app,x_for=0,x_proto=cfg.proxy_fix_proto,x_host=cfg.proxy_fix_host,x_port=0,x_prefix=0)
     class RedactOAuthQuery(logging.Filter):
         def filter(self, record):
             if record.args: record.args=tuple(re.sub(r"(/ebay/callback)\?[^ ]+",r"\1?[REDACTED]",str(v)) for v in record.args)
@@ -81,7 +91,7 @@ def create_app(config=None, http=None, stripe_adapter=None):
         expected=session.get("csrf_token")
         if request.method=="POST" and request.endpoint!="stripe_webhook" and (not expected or not secrets.compare_digest(expected, request.form.get("csrf_token", ""))): abort(400,"Invalid CSRF token")
 
-    public_endpoints={"shop","shop_item","media","checkout","order_status","order_success","order_cancel","fake_complete_order","fake_cancel_order","stripe_webhook","static","login"}
+    public_endpoints={"healthz","shop","shop_item","media","checkout","order_status","order_success","order_cancel","fake_complete_order","fake_cancel_order","stripe_webhook","static","login"}
     @app.before_request
     def seller_guard():
         # Order fulfillment data is never public, even on an incompletely
@@ -91,6 +101,9 @@ def create_app(config=None, http=None, stripe_adapter=None):
         if request.endpoint in public_endpoints: return
         if not session.get("seller_authenticated"):
             return redirect(url_for("login",next=request.full_path if request.method=="GET" else ""))
+
+    @app.get("/healthz")
+    def healthz(): return jsonify({"status":"ok"})
 
     @app.route("/login",methods=["GET","POST"])
     def login():
@@ -564,6 +577,27 @@ def create_app(config=None, http=None, stripe_adapter=None):
             flash(f"Order reconciliation complete: {result}","success")
         except EbayError as e: flash(str(e),"error")
         return redirect(url_for("ebay_settings"))
+
+    def bounded(value):
+        if value < 1 or value > 500: raise click.BadParameter("must be between 1 and 500",param_hint="--limit")
+        return value
+    @app.cli.command("storefront-maintenance")
+    @click.option("--limit",type=int,default=100,show_default=True)
+    def storefront_maintenance(limit):
+        """Expire a bounded batch of stale storefront reservations."""
+        click.echo(f"expired={db.expire_reservations(bounded(limit))}")
+    @app.cli.command("ebay-reconcile-orders")
+    @click.option("--limit",type=int,default=100,show_default=True)
+    def ebay_reconcile_cli(limit):
+        """Reconcile a bounded batch of eBay Sandbox orders."""
+        limit=bounded(limit)
+        if cfg.environment != "sandbox": raise click.ClickException("eBay reconciliation is restricted to Sandbox")
+        if cfg.marketplace_mock_mode: raise click.ClickException("eBay reconciliation requires the Sandbox provider")
+        try: result=adapters()["ebay"].reconcile_orders(max_orders=limit)
+        except Exception as exc:
+            app.logger.error("Sandbox eBay reconciliation failed: %s",type(exc).__name__)
+            raise click.ClickException("eBay reconciliation failed") from exc
+        click.echo(" ".join(f"{key}={result.get(key,0)}" for key in ("processed","duplicate","unknown")))
     @app.route("/sandbox",methods=["GET","POST"])
     def sandbox():
         if cfg.environment != "sandbox": abort(404)

@@ -107,10 +107,12 @@ class EbayService:
         classification=("ambiguous" if remote_offer and remote_offer!=offer else "published" if status in ("PUBLISHED","ACTIVE") else
             "withdrawn" if status in ("WITHDRAWN","ENDED") else "ambiguous")
         return {"classification":classification,"offer_id":offer,"listing_id":listing or item.get("ebay_listing_id"),"status":status or None}
-    def reconcile_orders(self):
+    def reconcile_orders(self,max_orders=None):
         data=self.client.request("GET","/sell/fulfillment/v1/order?filter=orderfulfillmentstatus:%7BNOT_STARTED,IN_PROGRESS%7D")
         counts={"processed":0,"duplicate":0,"unknown":0}
-        for order in data.get("orders",[]):
+        orders=data.get("orders",[])
+        if max_orders is not None: orders=orders[:max_orders]
+        for order in orders:
             payment=(order.get("orderPaymentStatus") or "").upper()
             for line in order.get("lineItems",[]):
                 sku=line.get("sku"); listing=(line.get("legacyItemId") or line.get("listingId")); qty=int(line.get("quantity",1))
