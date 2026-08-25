@@ -65,13 +65,34 @@ class RefundService:
         if order["state"]!="sold" or order["payment_state"]!="captured": raise RefundError("Only a sold, captured order can be refunded")
         if order["captured_amount"] is None or not order["captured_currency"]: raise RefundError("Persisted capture amount is unavailable")
         claim=self.db.claim_operation(public_id,"stripe_full_refund")
-        if claim["disposition"] in ("busy","already_complete"): return self.db.get_order(public_id)
+        if claim["disposition"]=="busy":
+            # The operation claim and lifecycle transition are intentionally
+            # separate short transactions.  A concurrent request can therefore
+            # observe the claim in the tiny window before its owner records
+            # ``pending``.  Converge that request on the durable pending state
+            # rather than returning a misleading ``none`` response.  Only the
+            # claim owner continues to Stripe, so this cannot create a second
+            # provider refund.
+            current=self.db.get_order(public_id)
+            if current["refund_state"]=="none":
+                current=self.db.compare_and_set_refund(public_id,"none","pending",actor=actor,
+                    metadata={"fulfillment_state_at_request":order["fulfillment_state"],
+                              "amount":order["captured_amount"],
+                              "currency":order["captured_currency"].upper()},
+                    dedupe_key=f"refund-request:{public_id}") or self.db.get_order(public_id)
+            return current
+        if claim["disposition"]=="already_complete": return self.db.get_order(public_id)
         if claim["disposition"]!="claimed": raise RefundError("Refund cannot be created")
         metadata={"fulfillment_state_at_request":order["fulfillment_state"],"amount":order["captured_amount"],
                   "currency":order["captured_currency"].upper()}
         pending=self.db.compare_and_set_refund(public_id,"none","pending",actor=actor,metadata=metadata,
                                                dedupe_key=f"refund-request:{public_id}")
-        if not pending: return self.db.get_order(public_id)
+        if not pending:
+            # A concurrent busy caller may have closed the claim/pending
+            # transaction gap above.  The claim owner must still perform the
+            # single idempotent provider call.
+            pending=self.db.get_order(public_id)
+            if pending["refund_state"]!="pending": return pending
         try:
             refund=self.stripe.create_full_refund(order["stripe_payment_intent_id"],order["captured_amount"],
                                                    order["captured_currency"],public_id)
