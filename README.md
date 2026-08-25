@@ -137,7 +137,41 @@ Production requires a separate production keyset and an authorized production se
 
 Set `EBAY_MARKETPLACE_ID` and `EBAY_CURRENCY`, an enabled `EBAY_MERCHANT_LOCATION_KEY`, and fulfillment, payment, and return policy IDs owned by the same seller and marketplace. The seller must have production selling privileges, be enrolled in Business Policies, and authorize the base, Inventory, Account, and Fulfillment scopes. Existing grants made before Fulfillment was added must be reauthorized.
 
-Local storefront files remain canonical. For real eBay listings the application uploads them directly to eBay Picture Services with the item's persisted Sandbox or Production OAuth configuration; EPS identities and URLs are tracked separately from local filenames.
+Local storefront files remain canonical. For real eBay listings the currently
+active default is eBay's **Media API** (`EBAY_IMAGE_UPLOAD_API=media`); its
+`imageUrl` is stored as `ebay_eps_url`, its documented `imageId` (when present)
+as `ebay_image_id`, and the local bytes' SHA-256 as
+`ebay_source_fingerprint`. The legacy Trading API
+`UploadSiteHostedPictures` transport remains explicitly selectable with
+`EBAY_IMAGE_UPLOAD_API=trading` during migration. Its `FullURL` maps to
+`ebay_eps_url`; it does not require an invented image ID. eBay has scheduled
+`UploadSiteHostedPictures` for decommissioning on **September 30, 2026**, so
+new deployments must use Media and existing Trading deployments should migrate.
+
+### Image-upload migration runbook
+
+1. In Sandbox, authorize the seller for the base OAuth scope and the Media API's
+   required `sell.inventory` scope, while retaining the Inventory, Account, and
+   Fulfillment scopes used elsewhere by Vintage Ops. Verify file upload, a valid
+   HTTPS `imageUrl`, listing preview, photo order, retry, and fingerprint reuse.
+2. Confirm response mapping before rollout: Media `imageUrl` →
+   `ebay_eps_url`, Media `imageId` → optional `ebay_image_id`, and Trading
+   `SiteHostedPictureDetails.FullURL` → `ebay_eps_url`. Both providers use the
+   locally calculated SHA-256 → `ebay_source_fingerprint`; provider output is
+   never trusted as the source digest.
+3. Roll out `EBAY_IMAGE_UPLOAD_API=media` to a small production cohort, monitor
+   sanitized success/failure counts and latency, then expand. Existing hosted
+   URLs and fingerprints remain reusable, making the switch incremental.
+4. Roll back by restoring `EBAY_IMAGE_UPLOAD_API=trading` only while that API is
+   available. Do not clear persisted URLs or fingerprints. A failed candidate
+   photo set must leave the last-known-good promoted URL set intact, and a retry
+   should upload only changed or failed photos.
+
+Observability must contain only HTTP status, method, relative path, eBay error
+codes/severity and approved diagnostic text, plus eBay correlation identifiers.
+Never log or retain raw XML, authorization headers, OAuth tokens, multipart
+bodies, local/original filenames, or image bytes. Alerts and support exports
+must follow the same allow-list and redaction rules.
 
 Vintage Ops uses scheduled Fulfillment API reconciliation rather than browser automation. Invoke the seller reconciliation action periodically and ensure the production account has the Fulfillment grant. If notifications are added, separately configure the eBay notification destination/account challenge-response requirements; notifications do not remove the need for idempotent order-line processing.
 

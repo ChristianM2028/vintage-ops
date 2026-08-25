@@ -66,7 +66,7 @@ def test_eps_partial_failure_is_incremental_and_promotes_only_when_complete(tmp_
     item=db.update_item(item['id'],ebay_integration_mode='ebay_production')
     client=PartialMediaClient()
     with pytest.raises(EbayError) as error: EbayImagePublisher(cfg,db,client).publish(item)
-    assert error.value.kind=='photo_partial_failure' and error.value.details[0]['filename']=='b'
+    assert error.value.kind=='photo_partial_failure' and error.value.details[0]['photo_id']==item['photos'][1]['id']
     partial=db.get_item(item['id'])
     assert json.loads(partial['photo_urls'])==old
     assert partial['photos'][0]['ebay_image_id']=='IMAGE-a' and partial['photos'][1]['ebay_upload_error']=='Safe upload failure'

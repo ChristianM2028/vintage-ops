@@ -39,6 +39,9 @@ class Config:
     permitted_image_extensions: tuple = tuple(x.strip().lower().lstrip(".") for x in os.getenv("PERMITTED_IMAGE_EXTENSIONS", "jpg,jpeg,png,gif,webp").split(",") if x.strip())
     max_photo_count: int = int(os.getenv("MAX_PHOTO_COUNT", "10"))
     metadata_cache_seconds: int = int(os.getenv("EBAY_METADATA_CACHE_SECONDS", "86400"))
+    # Explicit during the EPS-to-Media migration; never infer a protocol from a
+    # response's content type.
+    ebay_image_upload_api: str = os.getenv("EBAY_IMAGE_UPLOAD_API", "media").strip().lower()
     seller_username: str = os.getenv("SELLER_USERNAME", "")
     seller_password_hash: str = os.getenv("SELLER_PASSWORD_HASH", "")
     session_cookie_secure: bool = env_bool("SESSION_COOKIE_SECURE", False)
@@ -67,3 +70,5 @@ class Config:
             raise ValueError("Stripe shipping countries must be two-letter country codes")
         if self.proxy_fix_proto not in (0, 1) or self.proxy_fix_host not in (0, 1):
             raise ValueError("Proxy trust values must be 0 or 1")
+        if self.ebay_image_upload_api not in ("media", "trading"):
+            raise ValueError("EBAY_IMAGE_UPLOAD_API must be media or trading")

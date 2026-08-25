@@ -1,0 +1,2 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ebl:UploadSiteHostedPicturesResponse xmlns:ebl="urn:ebay:apis:eBLBaseComponents"><ebl:Ack>Success</ebl:Ack><ebl:SiteHostedPictureDetails><ebl:FullURL>https://i.ebayimg.com/images/g/prefixed/s-l1600.jpg</ebl:FullURL></ebl:SiteHostedPictureDetails></ebl:UploadSiteHostedPicturesResponse>
