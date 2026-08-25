@@ -2,7 +2,7 @@ import json, logging, os, re, secrets
 from dataclasses import replace
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from flask import Flask, abort, flash, jsonify, redirect, render_template, request, send_from_directory, session, url_for
+from flask import Flask, abort, flash, jsonify, make_response, redirect, render_template, request, send_from_directory, session, url_for
 from functools import wraps
 from urllib.parse import urlsplit
 from werkzeug.security import check_password_hash
@@ -86,7 +86,7 @@ def create_app(config=None, http=None, stripe_adapter=None):
     def seller_guard():
         # Order fulfillment data is never public, even on an incompletely
         # configured development install where the legacy seller UI is open.
-        always_protected={"orders","order_detail","seller_cancel_order","seller_retry_order","seller_refund_order","seller_recheck_refund","manual_recheck","manual_resume","manual_cancel","manual_reconcile_canceled","manual_reconcile_captured","mark_packing","mark_shipped","correct_tracking","mark_delivered","add_order_note","acknowledge_attention"}
+        always_protected={"orders","order_detail","packing_slip","seller_cancel_order","seller_retry_order","seller_refund_order","seller_recheck_refund","manual_recheck","manual_resume","manual_cancel","manual_reconcile_canceled","manual_reconcile_captured","mark_packing","mark_shipped","correct_tracking","mark_delivered","add_order_note","acknowledge_attention"}
         if request.endpoint not in always_protected and (not cfg.seller_username or not cfg.seller_password_hash): return
         if request.endpoint in public_endpoints: return
         if not session.get("seller_authenticated"):
@@ -292,7 +292,9 @@ def create_app(config=None, http=None, stripe_adapter=None):
 
     def fake_development_mode(): return cfg.stripe_fake_mode and cfg.environment != "production"
     def render_order(public_id, **context):
-        return render_template("order_status.html",order=db.get_order(public_id) or abort(404),fake_development_mode=fake_development_mode(),**context)
+        response=make_response(render_template("order_status.html",order=db.public_order_status(public_id) or abort(404),fake_development_mode=fake_development_mode(),**context))
+        response.headers.update({"Cache-Control":"no-store","X-Robots-Tag":"noindex, nofollow","Referrer-Policy":"no-referrer"})
+        return response
     @app.get("/shop/order/<public_id>")
     def order_status(public_id): return render_order(public_id)
     @app.get("/shop/order/<public_id>/success")
@@ -321,22 +323,33 @@ def create_app(config=None, http=None, stripe_adapter=None):
 
     @app.get("/orders")
     def orders():
-        allowed={"state","payment_state","date","sku","order_id","page"}
+        allowed={"state","payment_state","fulfillment_state","refund_state","attention","date","sku","order_id","page"}
         if set(request.args)-allowed: abort(400,"Unknown order filter")
         states=set(db.ORDER_TRANSITIONS); payment_states={"unpaid","authorized","captured","cancelled"}
         filters={key:request.args.get(key,"").strip() for key in allowed-{"page"}}
         if filters["state"] and filters["state"] not in states: abort(400,"Invalid order state")
         if filters["payment_state"] and filters["payment_state"] not in payment_states: abort(400,"Invalid payment state")
+        fulfillment_states={"not_applicable","unfulfilled","packing","shipped","delivered"}; refund_states={"none","pending","refunded","manual_resolution"}
+        if filters["fulfillment_state"] and filters["fulfillment_state"] not in fulfillment_states: abort(400,"Invalid fulfillment state")
+        if filters["refund_state"] and filters["refund_state"] not in refund_states: abort(400,"Invalid refund state")
+        if filters["attention"] not in ("","open","none"): abort(400,"Invalid attention filter")
         if filters["date"] and not re.fullmatch(r"\d{4}-\d{2}-\d{2}",filters["date"]): abort(400,"Invalid date")
         if any(len(filters[x])>100 for x in ("sku","order_id")): abort(400,"Order filter is too long")
         try: page=int(request.args.get("page","1"))
         except ValueError: abort(400,"Invalid page")
         if page<1 or page>10000: abort(400,"Invalid page")
         rows,total=db.seller_orders(filters,page,25)
-        return render_template("orders.html",orders=rows,filters=filters,page=page,pages=max(1,(total+24)//25),states=sorted(states),payment_states=sorted(payment_states))
+        return render_template("orders.html",orders=rows,filters=filters,page=page,pages=max(1,(total+24)//25),states=sorted(states),payment_states=sorted(payment_states),fulfillment_states=sorted(fulfillment_states),refund_states=sorted(refund_states),summary=db.seller_order_summary())
 
     @app.get("/orders/<public_id>")
-    def order_detail(public_id): return render_template("order_detail.html",order=db.seller_order(public_id) or abort(404),manual=manual_resolution_service.available_actions(public_id))
+    def order_detail(public_id):
+        response=make_response(render_template("order_detail.html",order=db.seller_order(public_id) or abort(404),manual=manual_resolution_service.available_actions(public_id)))
+        response.headers.update({"Cache-Control":"private, no-store","Referrer-Policy":"no-referrer"}); return response
+    @app.get("/orders/<public_id>/packing-slip")
+    def packing_slip(public_id):
+        order=db.seller_order(public_id) or abort(404)
+        response=make_response(render_template("packing_slip.html",order=order,business_name=cfg.business_name,business_address=cfg.business_address))
+        response.headers.update({"Cache-Control":"private, no-store","Referrer-Policy":"no-referrer","X-Robots-Tag":"noindex"}); return response
     def manual_action(call):
         try: call()
         except ManualResolutionError as exc: abort(409,str(exc))

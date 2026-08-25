@@ -48,6 +48,8 @@ class Config:
     stripe_cancel_url: str = os.getenv("STRIPE_CANCEL_URL", "http://127.0.0.1:5000/shop/order/{ORDER_ID}/cancel")
     stripe_fake_mode: bool = env_bool("STRIPE_FAKE_MODE", True)
     reservation_seconds: int = int(os.getenv("STOREFRONT_RESERVATION_SECONDS", "1800"))
+    business_name: str = os.getenv("BUSINESS_NAME", "Vintage Ops")
+    business_address: str = os.getenv("BUSINESS_ADDRESS", "")
     stripe_shipping_countries: tuple = tuple(
         country.strip().upper() for country in os.getenv("STRIPE_SHIPPING_COUNTRIES", "US").split(",")
         if country.strip()

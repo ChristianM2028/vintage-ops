@@ -240,6 +240,21 @@ class Database:
         own=con is None; con=con or self.connect(); row=con.execute("SELECT * FROM storefront_orders WHERE public_id=?",(public_id,)).fetchone(); result=dict(row) if row else None
         if own: con.close()
         return result
+    def public_order_status(self, public_id):
+        """Allowlisted shopper projection; never expose provider, customer or internal data."""
+        with self.connect() as con:
+            row=con.execute("""SELECT o.public_id,o.state,o.payment_state,o.fulfillment_state,
+                o.refund_state,o.created_at,o.tracking_carrier,o.tracking_number,o.tracking_url,
+                i.sku,i.title,i.condition,i.brand,i.size,i.color
+                FROM storefront_orders o JOIN items i ON i.id=o.item_id WHERE o.public_id=?""",(public_id,)).fetchone()
+            if not row: return None
+            result={key:row[key] for key in ("public_id","state","payment_state","fulfillment_state",
+                "refund_state","created_at","sku","title","condition","brand","size","color")}
+            result["payment_outcome"]=("paid" if row["payment_state"]=="captured" else
+                "not_completed" if row["payment_state"] in ("cancelled","unpaid") else "processing")
+            if row["fulfillment_state"] in ("shipped","delivered"):
+                result.update(tracking_carrier=row["tracking_carrier"],tracking_number=row["tracking_number"],tracking_url=row["tracking_url"])
+            return result
     def find_order_by_stripe(self, session_id=None, payment_intent_id=None):
         with self.connect() as con:
             row=con.execute("SELECT * FROM storefront_orders WHERE stripe_checkout_session_id=? OR stripe_payment_intent_id=?",(session_id or "",payment_intent_id or "")).fetchone()
@@ -541,11 +556,16 @@ class Database:
             if filters.get(key): clauses.append(f"{column}=?"); args.append(filters[key])
         if filters.get("date"):
             clauses.append("substr(o.created_at,1,10)=?"); args.append(filters["date"])
+        if filters.get("attention") == "open":
+            clauses.append("(o.state='manual_resolution' OR o.refund_state='manual_resolution' OR EXISTS(SELECT 1 FROM storefront_attention_cases ac WHERE ac.order_id=o.id AND ac.state!='resolved') OR EXISTS(SELECT 1 FROM storefront_operations ao WHERE ao.order_id=o.id AND ao.state IN ('failed','manual_resolution')))")
+        elif filters.get("attention") == "none":
+            clauses.append("NOT (o.state='manual_resolution' OR o.refund_state='manual_resolution' OR EXISTS(SELECT 1 FROM storefront_attention_cases ac WHERE ac.order_id=o.id AND ac.state!='resolved') OR EXISTS(SELECT 1 FROM storefront_operations ao WHERE ao.order_id=o.id AND ao.state IN ('failed','manual_resolution')))")
         where=(" WHERE "+" AND ".join(clauses)) if clauses else ""
         with self.connect() as c:
             total=c.execute("SELECT COUNT(*) FROM storefront_orders o JOIN items i ON i.id=o.item_id"+where,args).fetchone()[0]
             rows=c.execute("""SELECT o.*,i.sku,i.title,r.state reservation_state,r.expires_at,
-                EXISTS(SELECT 1 FROM storefront_operations op WHERE op.order_id=o.id AND op.state IN ('failed','manual_resolution')) operation_attention
+                EXISTS(SELECT 1 FROM storefront_operations op WHERE op.order_id=o.id AND op.state IN ('failed','manual_resolution')) operation_attention,
+                EXISTS(SELECT 1 FROM storefront_attention_cases ac WHERE ac.order_id=o.id AND ac.state!='resolved') open_attention
                 FROM storefront_orders o JOIN items i ON i.id=o.item_id LEFT JOIN item_reservations r ON r.order_id=o.id"""+where+" ORDER BY o.created_at DESC,o.id DESC LIMIT ? OFFSET ?",[*args,per_page,(page-1)*per_page]).fetchall()
             return [dict(x) for x in rows],total
     def seller_order_summary(self):
@@ -558,7 +578,7 @@ class Database:
                 SUM(fulfillment_state='delivered') delivered,
                 SUM(refund_state='pending') refunds_pending,
                 SUM(refund_state='manual_resolution') refunds_manual_resolution,
-                (SELECT COUNT(*) FROM storefront_attention_cases WHERE state!='resolved') open_attention
+                (SELECT COUNT(*) FROM storefront_orders oa WHERE oa.state='manual_resolution' OR oa.refund_state='manual_resolution' OR EXISTS(SELECT 1 FROM storefront_attention_cases ac WHERE ac.order_id=oa.id AND ac.state!='resolved')) open_attention
                 FROM storefront_orders""").fetchone()
             return {key:(row[key] or 0) for key in row.keys()}
     def seller_order(self,public_id):
@@ -567,7 +587,7 @@ class Database:
                 i.ebay_listing_id,i.ebay_offer_id,i.ebay_publication_state,r.state reservation_state,r.expires_at,r.close_reason
                 FROM storefront_orders o JOIN items i ON i.id=o.item_id LEFT JOIN item_reservations r ON r.order_id=o.id WHERE o.public_id=?""",(public_id,)).fetchone()
             if not row:return None
-            result=dict(row); result["operations"]=[dict(x) for x in c.execute("SELECT * FROM storefront_operations WHERE order_id=? ORDER BY created_at,id",(row["id"],))]
+            result=dict(row); result["operations"]=[{k:x[k] for k in ("operation_type","state","attempts","created_at","updated_at")} for x in c.execute("SELECT * FROM storefront_operations WHERE order_id=? ORDER BY created_at,id",(row["id"],))]
             result["reviews"]=[dict(x) for x in c.execute("SELECT * FROM storefront_resolution_reviews WHERE order_id=? ORDER BY created_at DESC,id DESC",(row["id"],))]
             result["resolution_actions"]=[dict(x) for x in c.execute("SELECT * FROM storefront_resolution_actions WHERE order_id=? ORDER BY created_at,id",(row["id"],))]
             protected=row["state"] in ("authorized","ebay_withdrawal_pending","capture_pending","paid","authorization_cancel_pending","manual_resolution") or row["payment_state"] in ("authorized","captured")
@@ -576,6 +596,9 @@ class Database:
             result["notes"]=[dict(x) for x in c.execute("SELECT * FROM storefront_order_notes WHERE order_id=? ORDER BY created_at,id",(row["id"],))]
             result["tracking_revisions"]=[dict(x) for x in c.execute("SELECT * FROM storefront_tracking_revisions WHERE order_id=? ORDER BY created_at,id",(row["id"],))]
             result["attention_cases"]=[dict(x) for x in c.execute("SELECT * FROM storefront_attention_cases WHERE order_id=? ORDER BY created_at,id",(row["id"],))]
+            for key,prefix in (("stripe_checkout_session_id","cs_"),("stripe_payment_intent_id","pi_"),("stripe_refund_id","re_")):
+                value=result.get(key) or ""
+                result["safe_"+key]=value if value.startswith(prefix) and all(ch.isalnum() or ch=="_" for ch in value) else None
             return result
     def process_order_line(self,order_id,line_id,sku,listing_id,quantity,payment,fulfillment,raw):
         """Deduplicate an order line and atomically reduce immediately-visible stock."""
