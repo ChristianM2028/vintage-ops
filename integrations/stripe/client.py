@@ -39,6 +39,29 @@ class StripeAdapter:
         if not payment_intent_id: raise StripeIntegrationError("missing_payment_intent","Payment authorization is not ready")
         try: return stripe.PaymentIntent.capture(payment_intent_id,api_key=self.cfg.stripe_secret_key,idempotency_key=key)
         except Exception as exc: raise StripeIntegrationError("capture_error","Capture result requires review",ambiguous=True) from exc
+    def retrieve_payment_intent(self, payment_intent_id):
+        """Return a deliberately narrow recovery projection, never an SDK object."""
+        import stripe
+        if not payment_intent_id:
+            raise StripeIntegrationError("missing_payment_intent","Payment authorization requires review",ambiguous=True)
+        try:
+            result=stripe.PaymentIntent.retrieve(payment_intent_id,api_key=self.cfg.stripe_secret_key)
+            projected={"id":getattr(result,"id",None),"status":getattr(result,"status",None),
+                "capture_method":getattr(result,"capture_method",None),"amount":getattr(result,"amount",None),
+                "amount_capturable":getattr(result,"amount_capturable",None),
+                "amount_received":getattr(result,"amount_received",None),
+                "currency":str(getattr(result,"currency","") or "").upper()}
+            if projected["id"] != payment_intent_id or not projected["status"]:
+                raise ValueError("malformed")
+            return projected
+        except StripeIntegrationError: raise
+        except Exception as exc:
+            name=type(exc).__name__.lower(); status=getattr(exc,"http_status",None)
+            kind=("provider_identity" if "authentication" in name or status in (401,403) else
+                  "not_found" if status==404 else
+                  "transport" if any(x in name for x in ("connection","timeout","apierror")) else
+                  "malformed_result" if isinstance(exc,ValueError) else "provider_error")
+            raise StripeIntegrationError(kind,"Payment authorization requires provider review",ambiguous=True) from exc
     def cancel(self, payment_intent_id, key):
         import stripe
         if not payment_intent_id: raise StripeIntegrationError("missing_payment_intent","Payment authorization is not ready")
