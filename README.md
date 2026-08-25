@@ -457,11 +457,17 @@ these placeholder-named variables on that service only:
 Retain old encryption keys while their backups remain restorable; rotation does
 not re-encrypt existing objects.
 
-Create a separate Railway cron service scheduled once daily at **03:15 UTC**
-(`15 3 * * *`) with start command `python scripts/run_scheduled_backup.py`. Give
-it only `BACKUP_JOB_URL=https://<web-service>/internal/scheduled-backup` and the
-matching `BACKUP_SCHEDULED_JOB_TOKEN`. It must have no volume, database settings,
-or bucket credentials. This is separate from the frequent scheduled-maintenance
+Create a separate Railway cron service for the backup caller, then configure it
+exactly as follows:
+
+1. In the service settings, set **Config File** to `/railway-backup.toml`.
+2. In the service cron settings, set **Cron Schedule** to `15 3 * * *` (03:15
+   UTC daily).
+
+Give this service only
+`BACKUP_JOB_URL=https://<web-service>/internal/scheduled-backup` and the matching
+`BACKUP_SCHEDULED_JOB_TOKEN`. It must have no volume, database configuration, or
+bucket credentials. This is separate from the frequent scheduled-maintenance
 cron above.
 
 The web endpoint uses a database lease and one canonical UTC-date object key, so

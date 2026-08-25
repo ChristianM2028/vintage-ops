@@ -1,3 +1,4 @@
+import tomllib
 from dataclasses import replace
 from pathlib import Path
 
@@ -27,6 +28,34 @@ def test_checked_in_launch_contract():
     assert 'DATABASE_PATH = "/data/vintage_ops.sqlite3"' in railway
     assert 'UPLOAD_DIRECTORY = "/data/uploads"' in railway
     assert 'BACKUP_DIRECTORY = "/data/backups"' in railway
+
+
+def test_railway_web_and_backup_service_contracts():
+    with Path("railway.toml").open("rb") as config_file:
+        web_config=tomllib.load(config_file)
+    with Path("railway-backup.toml").open("rb") as config_file:
+        backup_config=tomllib.load(config_file)
+
+    assert web_config["build"] == {
+        "builder":"DOCKERFILE", "dockerfilePath":"Dockerfile"}
+    assert web_config["deploy"]["startCommand"] == "/app/start.sh"
+    assert web_config["deploy"]["healthcheckPath"] == "/healthz"
+    assert web_config["deploy"]["restartPolicyType"] == "ON_FAILURE"
+    assert web_config["variables"]["DATABASE_PATH"] == "/data/vintage_ops.sqlite3"
+    assert web_config["variables"]["UPLOAD_DIRECTORY"] == "/data/uploads"
+    assert web_config["variables"]["BACKUP_DIRECTORY"] == "/data/backups"
+
+    assert backup_config["build"] == {
+        "builder":"DOCKERFILE", "dockerfilePath":"Dockerfile"}
+    assert backup_config["deploy"]["startCommand"] == (
+        "python scripts/run_scheduled_backup.py")
+    assert backup_config["deploy"]["restartPolicyType"] == "NEVER"
+    assert not any(key.startswith("healthcheck") for key in backup_config["deploy"])
+    assert "variables" not in backup_config
+
+    readme=Path("README.md").read_text()
+    assert "/railway-backup.toml" in readme
+    assert "15 3 * * *" in readme
 
 
 def test_startup_uses_only_configured_persistent_paths(tmp_path, monkeypatch):
