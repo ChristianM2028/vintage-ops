@@ -9,6 +9,7 @@ from app import create_app
 from config import Config
 from integrations.stripe.client import StripeAdapter
 from integrations.stripe import StripeIntegrationError
+from refund_service import RefundService
 
 
 def test_live_stripe_keys_are_always_rejected():
@@ -55,6 +56,60 @@ def test_webhook_attaches_intent_sells_and_audits_without_public_pii(tmp_path):
     public=shopper.get(f"/shop/order/{public_id}")
     assert b"shipping_line1" not in public.data and b"customer_email" not in public.data
     assert shopper.get("/orders").status_code==302
+
+
+def test_refund_webhooks_reconcile_exact_full_refunds_without_creating_them(tmp_path):
+    cfg = replace(Config(), database_path=str(tmp_path/"refund-webhooks.sqlite"), stripe_fake_mode=True)
+    app=create_app(cfg); db=app.extensions["vintage_db"]; stripe=app.extensions["stripe_adapter"]
+    item=db.create_item(sku="REFUND-1",title="Coat",description="",price="25.00",currency="USD",quantity=1,condition="Used",brand="",size="",color="",category="1",category_name="Coats")
+    db.update_item(item["id"],status="Active",storefront_visible=1)
+    client=app.test_client()
+    with client.session_transaction() as session: session["csrf_token"]="token"
+    response=client.post("/shop/item/REFUND-1/checkout",data={"csrf_token":"token"})
+    public_id=response.headers["Location"].rsplit("/",1)[-1]
+    assert client.post(f"/shop/order/{public_id}/complete",data={"csrf_token":"token"}).status_code==303
+    order=db.get_order(public_id); pi=order["stripe_payment_intent_id"]
+
+    def deliver(event_id,event_type,refund):
+        event={"id":event_id,"type":event_type,"data":{"object":refund}}
+        body=json.dumps(event).encode(); signature=hmac.new(cfg.stripe_webhook_secret.encode(),body,hashlib.sha256).hexdigest()
+        return client.post("/stripe/webhook",data=body,headers={"Stripe-Signature":signature})
+
+    exact={"id":"re_external","payment_intent":pi,"amount":2500,"currency":"usd","status":"succeeded","metadata":{"order":public_id}}
+    assert deliver("evt_refund_1","refund.created",exact).status_code==200
+    assert db.get_order(public_id)["refund_state"]=="refunded"
+    assert stripe.refund_calls==[]
+
+    late=dict(exact,status="pending")
+    assert deliver("evt_refund_2","refund.updated",late).status_code==200
+    assert db.get_order(public_id)["refund_state"]=="refunded"
+    failed=dict(exact,status="failed")
+    assert deliver("evt_refund_3","refund.failed",failed).status_code==200
+    assert db.get_order(public_id)["refund_state"]=="refunded"
+    assert any(case["kind"]=="refund_contradiction" for case in db.seller_order(public_id)["attention_cases"])
+
+
+def test_identifiable_mismatched_refund_is_manual_review_and_charge_needs_refund_id(tmp_path):
+    assert RefundService.normalize_webhook("charge.refunded",{
+        "id":"ch_one","payment_intent":"pi_one","currency":"usd","amount_refunded":1000,
+        "refunds":{"data":[]}})==[]
+    assert RefundService.normalize_webhook("charge.refunded",{
+        "id":"ch_one","payment_intent":"pi_one","currency":"usd",
+        "refunds":{"data":[{"id":"re_one","amount":1000,"status":"succeeded"}]}})==[
+            {"id":"re_one","payment_intent":"pi_one","amount":1000,"currency":"usd",
+             "status":"succeeded","reference":None}]
+    cfg=replace(Config(),database_path=str(tmp_path/"refund-review.sqlite"),stripe_fake_mode=True)
+    app=create_app(cfg); db=app.extensions["vintage_db"]; client=app.test_client()
+    item=db.create_item(sku="REFUND-2",title="Coat",description="",price="10",currency="USD",quantity=1,condition="Used",brand="",size="",color="",category="1",category_name="Coats")
+    db.update_item(item["id"],status="Active",storefront_visible=1)
+    order=db.create_storefront_order("REFUND-2",provider_identity="fake")
+    order=db.attach_checkout(order["public_id"],"cs_refund_2","pi_refund_2")
+    db.record_provider_capture(order["public_id"],1000,"USD")
+    event={"id":"evt_bad_refund","type":"refund.updated","data":{"object":{"id":"re_bad","payment_intent":"pi_refund_2","amount":999,"currency":"usd","status":"succeeded"}}}
+    body=json.dumps(event).encode(); signature=hmac.new(cfg.stripe_webhook_secret.encode(),body,hashlib.sha256).hexdigest()
+    assert client.post("/stripe/webhook",data=body,headers={"Stripe-Signature":signature}).status_code==200
+    assert db.get_order(order["public_id"])["refund_state"]=="manual_resolution"
+    assert db.seller_order(order["public_id"])["attention_cases"][0]["summary"]=="Stripe refund data conflicts with the recorded full refund; review required."
 
 
 def test_failed_webhook_can_be_claimed_again(tmp_path):
