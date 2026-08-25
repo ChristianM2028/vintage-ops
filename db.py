@@ -241,6 +241,151 @@ class Database:
     def _event(self,c,order_id,old,new,source,category):
         if old!=new or category:
             c.execute("INSERT INTO storefront_order_events(order_id,from_state,to_state,source,category,created_at) VALUES(?,?,?,?,?,?)",(order_id,old,new,source,category,now()))
+
+    @staticmethod
+    def _clean_metadata(metadata):
+        """Serialize caller-sanitized audit data, rejecting non-JSON values."""
+        if metadata is None: return None
+        return json.dumps(metadata, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+    def append_order_event(self, public_id, category, source="seller", actor=None,
+                           lifecycle=None, old_value=None, new_value=None,
+                           metadata=None, dedupe_key=None, con=None):
+        """Append an audit event; a dedupe key makes retries harmless."""
+        own=con is None
+        if own: con=self.connect(); con.execute("BEGIN IMMEDIATE")
+        try:
+            order=con.execute("SELECT id,state FROM storefront_orders WHERE public_id=?",(public_id,)).fetchone()
+            if not order: raise ValueError("Order not found")
+            con.execute("""INSERT OR IGNORE INTO storefront_order_events
+                (order_id,from_state,to_state,source,category,actor,lifecycle,old_value,new_value,metadata_json,dedupe_key,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (order["id"],order["state"],order["state"],source,category,actor,lifecycle,
+                 old_value,new_value,self._clean_metadata(metadata),dedupe_key,now()))
+            row=con.execute("SELECT * FROM storefront_order_events WHERE order_id=? AND (? IS NOT NULL AND dedupe_key=?) ORDER BY id DESC LIMIT 1",
+                            (order["id"],dedupe_key,dedupe_key)).fetchone() if dedupe_key else con.execute("SELECT * FROM storefront_order_events WHERE id=last_insert_rowid()").fetchone()
+            if own: con.commit()
+            return dict(row) if row else None
+        except Exception:
+            if own: con.rollback()
+            raise
+        finally:
+            if own: con.close()
+
+    def _cas_order_field(self, public_id, field, expected, value, *, actor=None,
+                         metadata=None, dedupe_key=None, timestamps=None):
+        allowed={"fulfillment_state","refund_state"}
+        if field not in allowed: raise ValueError("Unsupported order lifecycle")
+        valid={"fulfillment_state":{"not_applicable","unfulfilled","packing","shipped","delivered"},
+               "refund_state":{"none","pending","refunded","manual_resolution"}}[field]
+        if expected not in valid or value not in valid: raise ValueError("Invalid lifecycle state")
+        with self.transaction(immediate=True) as c:
+            order=c.execute("SELECT * FROM storefront_orders WHERE public_id=?",(public_id,)).fetchone()
+            if not order: raise ValueError("Order not found")
+            if order[field]!=expected: return None
+            stamp=now(); assignments=[f"{field}=?","updated_at=?"]; values=[value,stamp]
+            for column,when in (timestamps or {}).items():
+                if column not in {"shipped_at","delivered_at","refunded_at"}: raise ValueError("Unsupported timestamp")
+                assignments.append(f"{column}=COALESCE({column},?)"); values.append(when or stamp)
+            changed=c.execute(f"UPDATE storefront_orders SET {','.join(assignments)} WHERE id=? AND {field}=?",
+                              (*values,order["id"],expected)).rowcount
+            if not changed: return None
+            self.append_order_event(public_id,field.removesuffix("_state")+"_changed",actor=actor,
+                lifecycle=field,old_value=expected,new_value=value,metadata=metadata,dedupe_key=dedupe_key,con=c)
+            return self.get_order(public_id,c)
+
+    def compare_and_set_fulfillment(self, public_id, expected, value, actor=None, metadata=None, dedupe_key=None):
+        timestamps={"shipped_at":None} if value=="shipped" else ({"delivered_at":None} if value=="delivered" else {})
+        return self._cas_order_field(public_id,"fulfillment_state",expected,value,actor=actor,metadata=metadata,dedupe_key=dedupe_key,timestamps=timestamps)
+
+    def compare_and_set_refund(self, public_id, expected, value, actor=None, metadata=None,
+                               dedupe_key=None, stripe_refund_id=None,
+                               captured_amount=None, captured_currency=None):
+        with self.transaction(immediate=True) as c:
+            order=c.execute("SELECT * FROM storefront_orders WHERE public_id=?",(public_id,)).fetchone()
+            if not order: raise ValueError("Order not found")
+            valid={"none","pending","refunded","manual_resolution"}
+            if expected not in valid or value not in valid: raise ValueError("Invalid lifecycle state")
+            if order["refund_state"]!=expected: return None
+            stamp=now(); refunded=stamp if value=="refunded" else None
+            changed=c.execute("""UPDATE storefront_orders SET refund_state=?,stripe_refund_id=COALESCE(?,stripe_refund_id),
+                captured_amount=COALESCE(?,captured_amount),captured_currency=COALESCE(?,captured_currency),
+                refunded_at=CASE WHEN ?='refunded' THEN COALESCE(refunded_at,?) ELSE refunded_at END,updated_at=?
+                WHERE id=? AND refund_state=?""",(value,stripe_refund_id,captured_amount,captured_currency,value,refunded,stamp,order["id"],expected)).rowcount
+            if not changed: return None
+            self.append_order_event(public_id,"refund_changed",actor=actor,lifecycle="refund_state",old_value=expected,
+                new_value=value,metadata=metadata,dedupe_key=dedupe_key,con=c)
+            return self.get_order(public_id,c)
+
+    def record_provider_capture(self, public_id, amount, currency):
+        """Store the amount confirmed by the payment provider without inference."""
+        if not isinstance(amount,int) or isinstance(amount,bool) or amount < 0 or not currency: raise ValueError("Captured amount and currency are required")
+        with self.transaction(immediate=True) as c:
+            changed=c.execute("""UPDATE storefront_orders SET
+                captured_amount=COALESCE(captured_amount,?),
+                captured_currency=COALESCE(captured_currency,?),updated_at=?
+                WHERE public_id=? AND (captured_amount IS NULL OR (captured_amount=? AND captured_currency=?))""",
+                (amount,currency.upper(),now(),public_id,amount,currency.upper())).rowcount
+            if not changed:
+                if not c.execute("SELECT 1 FROM storefront_orders WHERE public_id=?",(public_id,)).fetchone(): raise ValueError("Order not found")
+                raise ValueError("Conflicting provider capture")
+            return self.get_order(public_id,c)
+
+    def add_tracking_revision(self, public_id, request_key, carrier=None, tracking_number=None,
+                              tracking_url=None, actor=None):
+        if not request_key or not any((carrier,tracking_number,tracking_url)): raise ValueError("Tracking and request key are required")
+        with self.transaction(immediate=True) as c:
+            order=c.execute("SELECT * FROM storefront_orders WHERE public_id=?",(public_id,)).fetchone()
+            if not order: raise ValueError("Order not found")
+            existing=c.execute("SELECT * FROM storefront_tracking_revisions WHERE request_key=?",(request_key,)).fetchone()
+            if existing:
+                if existing["order_id"]!=order["id"]: raise ValueError("Tracking request key already used")
+                return dict(existing)
+            stamp=now(); cur=c.execute("""INSERT INTO storefront_tracking_revisions
+                (order_id,request_key,carrier,tracking_number,tracking_url,previous_carrier,previous_tracking_number,previous_tracking_url,actor,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?)""",(order["id"],request_key,carrier,tracking_number,tracking_url,
+                order["tracking_carrier"],order["tracking_number"],order["tracking_url"],actor,stamp))
+            c.execute("UPDATE storefront_orders SET tracking_carrier=?,tracking_number=?,tracking_url=?,updated_at=? WHERE id=?",
+                      (carrier,tracking_number,tracking_url,stamp,order["id"]))
+            self.append_order_event(public_id,"tracking_revised",actor=actor,lifecycle="tracking",metadata={"revision_id":cur.lastrowid},dedupe_key="tracking:"+request_key,con=c)
+            return dict(c.execute("SELECT * FROM storefront_tracking_revisions WHERE id=?",(cur.lastrowid,)).fetchone())
+
+    def append_order_note(self, public_id, note, actor=None):
+        if not note or not note.strip(): raise ValueError("Note is required")
+        with self.transaction(immediate=True) as c:
+            order=c.execute("SELECT id FROM storefront_orders WHERE public_id=?",(public_id,)).fetchone()
+            if not order: raise ValueError("Order not found")
+            cur=c.execute("INSERT INTO storefront_order_notes(order_id,note,actor,created_at) VALUES(?,?,?,?)",(order["id"],note.strip(),actor,now()))
+            return dict(c.execute("SELECT * FROM storefront_order_notes WHERE id=?",(cur.lastrowid,)).fetchone())
+
+    def create_attention_case(self, public_id, kind, summary, dedupe_key=None, actor=None):
+        with self.transaction(immediate=True) as c:
+            order=c.execute("SELECT id FROM storefront_orders WHERE public_id=?",(public_id,)).fetchone()
+            if not order: raise ValueError("Order not found")
+            stamp=now(); c.execute("INSERT OR IGNORE INTO storefront_attention_cases(order_id,kind,summary,dedupe_key,actor,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+                (order["id"],kind,summary,dedupe_key,actor,stamp,stamp))
+            row=c.execute("SELECT * FROM storefront_attention_cases WHERE order_id=? AND ((? IS NOT NULL AND dedupe_key=?) OR (? IS NULL AND id=last_insert_rowid())) ORDER BY id DESC LIMIT 1",
+                          (order["id"],dedupe_key,dedupe_key,dedupe_key)).fetchone()
+            return dict(row)
+
+    def set_attention_case_state(self, case_id, expected, value, actor=None):
+        if expected not in {"open","acknowledged","resolved"} or value not in {"open","acknowledged","resolved"}: raise ValueError("Invalid attention state")
+        with self.transaction(immediate=True) as c:
+            stamp=now(); column="acknowledged_at" if value=="acknowledged" else "resolved_at" if value=="resolved" else None
+            extra=f",{column}=COALESCE({column},?)" if column else ""; args=[value,actor,stamp]
+            if column: args.append(stamp)
+            args.extend((case_id,expected))
+            changed=c.execute(f"UPDATE storefront_attention_cases SET state=?,actor=?,updated_at=?{extra} WHERE id=? AND state=?",args).rowcount
+            row=c.execute("SELECT * FROM storefront_attention_cases WHERE id=?",(case_id,)).fetchone()
+            return dict(row) if changed and row else None
+
+    def attention_cases(self, state=None, limit=100):
+        if state is not None and state not in {"open","acknowledged","resolved"}: raise ValueError("Invalid attention state")
+        with self.connect() as c:
+            where=" WHERE a.state=?" if state else " WHERE a.state!='resolved'"
+            args=[state] if state else []
+            return [dict(row) for row in c.execute("""SELECT a.*,o.public_id FROM storefront_attention_cases a
+                JOIN storefront_orders o ON o.id=a.order_id"""+where+" ORDER BY a.updated_at,a.id LIMIT ?",(*args,limit))]
     def attach_checkout(self, public_id, session_id, payment_intent_id=None, source="shopper"):
         with self.transaction(immediate=True) as c:
             before=c.execute("SELECT * FROM storefront_orders WHERE public_id=?",(public_id,)).fetchone()
@@ -349,14 +494,17 @@ class Database:
             if item["quantity"]<1 or item["status"]=="Sold":
                 c.execute("UPDATE storefront_orders SET state='manual_resolution',conflict_details='Inventory sold by another channel',updated_at=? WHERE id=?",(now(),order["id"])); return self.get_order(public_id,c)
             c.execute("UPDATE items SET quantity=0,status='Sold',storefront_visible=0,updated_at=? WHERE id=?",(now(),order["item_id"]))
-            c.execute("UPDATE storefront_orders SET state='sold',payment_state='captured',updated_at=? WHERE id=?",(now(),order["id"]))
+            c.execute("""UPDATE storefront_orders SET state='sold',payment_state='captured',
+                fulfillment_state=CASE WHEN fulfillment_state='not_applicable' THEN 'unfulfilled' ELSE fulfillment_state END,
+                updated_at=? WHERE id=?""",(now(),order["id"]))
             c.execute("UPDATE item_reservations SET state='closed',close_reason='sold',updated_at=? WHERE order_id=?",(now(),order["id"]))
             self._event(c,order["id"],order["state"],"sold",source,"inventory_sold")
             return self.get_order(public_id,c)
 
     def seller_orders(self,filters,page=1,per_page=25):
         clauses=[]; args=[]
-        mapping={"state":"o.state","payment_state":"o.payment_state","sku":"i.sku","order_id":"o.public_id"}
+        mapping={"state":"o.state","payment_state":"o.payment_state","fulfillment_state":"o.fulfillment_state",
+                 "refund_state":"o.refund_state","sku":"i.sku","order_id":"o.public_id"}
         for key,column in mapping.items():
             if filters.get(key): clauses.append(f"{column}=?"); args.append(filters[key])
         if filters.get("date"):
@@ -368,6 +516,19 @@ class Database:
                 EXISTS(SELECT 1 FROM storefront_operations op WHERE op.order_id=o.id AND op.state IN ('failed','manual_resolution')) operation_attention
                 FROM storefront_orders o JOIN items i ON i.id=o.item_id LEFT JOIN item_reservations r ON r.order_id=o.id"""+where+" ORDER BY o.created_at DESC,o.id DESC LIMIT ? OFFSET ?",[*args,per_page,(page-1)*per_page]).fetchall()
             return [dict(x) for x in rows],total
+    def seller_order_summary(self):
+        """Return dashboard counts in one indexed aggregate query."""
+        with self.connect() as c:
+            row=c.execute("""SELECT COUNT(*) total,
+                SUM(fulfillment_state='unfulfilled') unfulfilled,
+                SUM(fulfillment_state='packing') packing,
+                SUM(fulfillment_state='shipped') shipped,
+                SUM(fulfillment_state='delivered') delivered,
+                SUM(refund_state='pending') refunds_pending,
+                SUM(refund_state='manual_resolution') refunds_manual_resolution,
+                (SELECT COUNT(*) FROM storefront_attention_cases WHERE state!='resolved') open_attention
+                FROM storefront_orders""").fetchone()
+            return {key:(row[key] or 0) for key in row.keys()}
     def seller_order(self,public_id):
         with self.connect() as c:
             row=c.execute("""SELECT o.*,i.sku,i.title,i.description,i.condition,i.brand,i.size,i.color,
@@ -376,6 +537,9 @@ class Database:
             if not row:return None
             result=dict(row); result["operations"]=[dict(x) for x in c.execute("SELECT * FROM storefront_operations WHERE order_id=? ORDER BY created_at,id",(row["id"],))]
             result["events"]=[dict(x) for x in c.execute("SELECT * FROM storefront_order_events WHERE order_id=? ORDER BY created_at,id",(row["id"],))]
+            result["notes"]=[dict(x) for x in c.execute("SELECT * FROM storefront_order_notes WHERE order_id=? ORDER BY created_at,id",(row["id"],))]
+            result["tracking_revisions"]=[dict(x) for x in c.execute("SELECT * FROM storefront_tracking_revisions WHERE order_id=? ORDER BY created_at,id",(row["id"],))]
+            result["attention_cases"]=[dict(x) for x in c.execute("SELECT * FROM storefront_attention_cases WHERE order_id=? ORDER BY created_at,id",(row["id"],))]
             return result
     def process_order_line(self,order_id,line_id,sku,listing_id,quantity,payment,fulfillment,raw):
         """Deduplicate an order line and atomically reduce immediately-visible stock."""
