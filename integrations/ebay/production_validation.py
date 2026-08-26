@@ -6,7 +6,7 @@ REQUIRED_SCOPES={"https://api.ebay.com/oauth/api_scope/sell.account","https://ap
 class ProductionSellerValidator:
     def __init__(self, config, db, client): self.cfg,self.db,self.client=config,db,client
     def validate(self, token_identity, scopes):
-        if self.cfg.environment != "production": raise EbayError("configuration","Production validation requires production endpoints")
+        if self.cfg.ebay_provider_mode != "production": raise EbayError("configuration","Production validation requires production endpoints")
         if not token_identity or token_identity != self.cfg.expected_ebay_seller_id: raise EbayError("provider_identity","Production token seller identity mismatch")
         if not REQUIRED_SCOPES.issubset(set(scopes)): raise EbayError("authentication","Production token is missing required selling scopes")
         identity=self.client.request("GET","/commerce/identity/v1/user/")

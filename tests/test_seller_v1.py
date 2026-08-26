@@ -34,7 +34,7 @@ def csrf(client):
 
 def test_create_validation_photos_inventory_and_actions(tmp_path):
     from app import create_app
-    cfg=Config(database_path=str(tmp_path/"app.sqlite"),upload_directory=str(tmp_path/"uploads"),marketplace_mock_mode=True)
+    cfg=Config(database_path=str(tmp_path/"app.sqlite"),upload_directory=str(tmp_path/"uploads"),ebay_provider_mode="mock")
     app=create_app(cfg); app.testing=True; client=app.test_client()
     token=csrf(client); bad=client.post("/",data={"csrf_token":token,"title":"Remember me"},content_type="multipart/form-data")
     assert bad.status_code==200 and b"Remember me" in bad.data and b"Price is required" in bad.data
@@ -53,7 +53,7 @@ def test_create_validation_photos_inventory_and_actions(tmp_path):
 
 def test_mock_mode_can_be_disabled(tmp_path):
     from app import create_app
-    app=create_app(Config(database_path=str(tmp_path/"real.sqlite"),marketplace_mock_mode=False))
+    app=create_app(Config(database_path=str(tmp_path/"real.sqlite"),ebay_provider_mode="sandbox"))
     from integrations.ebay.service import EbayService
     assert isinstance(app.extensions["marketplace_adapters"]()["ebay"],EbayService)
 

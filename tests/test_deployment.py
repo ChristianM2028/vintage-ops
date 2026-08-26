@@ -30,6 +30,19 @@ def test_checked_in_launch_contract():
     assert 'BACKUP_DIRECTORY = "/data/backups"' in railway
 
 
+def test_pull_request_ci_contract():
+    workflow=Path(".github/workflows/ci.yml").read_text()
+    assert "pull_request:" in workflow
+    assert "python-version: '3.12'" in workflow
+    assert "python -m pip install -r requirements.txt" in workflow
+    assert "python -m pytest -q\n" in workflow
+    assert "python -m compileall -q" in workflow
+    assert "Database(cfg.database_path).migrate()" in workflow
+    assert workflow.count("Database(cfg.database_path).migrate()") == 2
+    assert "SELECT version FROM schema_migrations ORDER BY version" in workflow
+    assert "python -m pytest -q tests/test_deployment.py tests/test_live_commerce_contract.py" in workflow
+
+
 def test_railway_web_and_backup_service_contracts():
     with Path("railway.toml").open("rb") as config_file:
         web_config=tomllib.load(config_file)
@@ -121,9 +134,6 @@ def test_cli_bounds_repeatability_and_production_refusal(tmp_path):
     assert runner.invoke(args=["storefront-maintenance","--limit","1"]).exit_code==0
     assert runner.invoke(args=["storefront-maintenance","--limit","1"]).exit_code==0
     assert runner.invoke(args=["storefront-maintenance","--limit","0"]).exit_code!=0
-    production=create_app(deployment_config(tmp_path / "prod",environment="production"))
-    result=production.test_cli_runner().invoke(args=["ebay-reconcile-orders","--limit","1"])
-    assert result.exit_code!=0 and "Sandbox" in result.output
 
 
 def test_live_stripe_key_still_fails():

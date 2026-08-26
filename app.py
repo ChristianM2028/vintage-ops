@@ -47,7 +47,7 @@ def create_app(config=None, http=None, stripe_adapter=None):
             return True
     logging.getLogger("werkzeug").addFilter(RedactOAuthQuery())
     db=Database(cfg.database_path); db.migrate(); http_session=http or requests.Session()
-    stripe_gateway=stripe_adapter or (FakeStripeAdapter(cfg) if cfg.stripe_fake_mode else StripeAdapter(cfg))
+    stripe_gateway=stripe_adapter or (FakeStripeAdapter(cfg) if cfg.stripe_is_fake else StripeAdapter(cfg))
     password_hash_valid=True
     if cfg.seller_password_hash:
         try: check_password_hash(cfg.seller_password_hash,"startup-validation-only")
@@ -68,14 +68,13 @@ def create_app(config=None, http=None, stripe_adapter=None):
     def resolve_ebay(item, establish=False):
         """Resolve from persisted item state, classifying an unlisted item once."""
         mode=item.get("ebay_integration_mode")
-        provider_mode=cfg.ebay_provider_mode or ("mock" if cfg.marketplace_mock_mode else cfg.environment)
-        active={"mock":"local_mock","sandbox":"ebay_sandbox","production":"ebay_production"}[provider_mode]
+        active=cfg.ebay_integration_identity
         if mode and mode != active:
             raise EbayError("provider_identity","Stored listing belongs to a different eBay environment")
         if not mode and establish:
             associated=any(item.get(k) for k in ("ebay_sku","ebay_offer_id","ebay_listing_id","ebay_publication_state"))
             if associated: raise EbayError("classification_required","This legacy published item needs an explicit eBay integration mode")
-            mode="local_mock" if cfg.marketplace_mock_mode else ("ebay_sandbox" if cfg.environment=="sandbox" else "ebay_production")
+            mode=cfg.ebay_integration_identity
             values={"ebay_integration_mode":mode}
             if mode!="local_mock": values.update({column:getattr(cfg,key) for key,column in SNAPSHOT_FIELDS.items()})
             item=db.update_item(item["id"],**values)
@@ -85,8 +84,8 @@ def create_app(config=None, http=None, stripe_adapter=None):
                    for column in SNAPSHOT_FIELDS.values()):
                 raise EbayError("classification_required","This item is missing its persisted eBay seller configuration")
             overrides={key:item[column] for key,column in SNAPSHOT_FIELDS.items()}
+            overrides["ebay_provider_mode"]="sandbox" if mode=="ebay_sandbox" else "production"
             overrides["environment"]="sandbox" if mode=="ebay_sandbox" else "production"
-            overrides["marketplace_mock_mode"]=False
             return real_components(overrides)[1],item
         raise EbayError("classification_required","Choose an eBay integration mode before operating on this item")
     order_service=OrderService(db,stripe_gateway,resolve_ebay,cfg)
@@ -94,7 +93,7 @@ def create_app(config=None, http=None, stripe_adapter=None):
     fulfillment_service=FulfillmentService(db)
     refund_service=RefundService(db,stripe_gateway)
     def adapters():
-        return {"ebay": MockEbayAdapter(cfg,db) if cfg.marketplace_mock_mode else real_components()[1]}
+        return {"ebay": MockEbayAdapter(cfg,db) if cfg.ebay_is_mock else real_components()[1]}
     def item_or_404(item_id): return db.get_item(item_id) or abort(404)
     def csrf_token():
         if "csrf_token" not in session: session["csrf_token"]=secrets.token_urlsafe(32)
@@ -160,7 +159,7 @@ def create_app(config=None, http=None, stripe_adapter=None):
         expected="Bearer "+cfg.scheduled_job_token if cfg.scheduled_job_token else ""
         if not expected or not supplied.startswith("Bearer ") or not secrets.compare_digest(supplied,expected):
             return jsonify({"status":"unauthorized"}),401
-        ebay=None if cfg.marketplace_mock_mode else adapters()["ebay"]
+        ebay=None if cfg.ebay_is_mock else adapters()["ebay"]
         result=run_scheduled_job(db,ebay,limit=cfg.scheduled_job_limit,lease_seconds=cfg.scheduled_job_lease_seconds)
         return jsonify(result), (200 if result["status"]=="ok" else 409 if result["status"]=="busy" else 502)
 
@@ -225,7 +224,7 @@ def create_app(config=None, http=None, stripe_adapter=None):
         category=values.get("category","").strip(); name=values.get("category_name","").strip()
         # Local mock mode has no taxonomy API. Retain its deliberately isolated
         # legacy fixtures; real seller workflows always require a suggestion.
-        if cfg.marketplace_mock_mode and category and not name:
+        if cfg.ebay_is_mock and category and not name:
             values["category_name"]=category
             return {},[],[],[]
         if not category or not name: return {},[],[],["Select a category from the suggestions."]
@@ -337,7 +336,7 @@ def create_app(config=None, http=None, stripe_adapter=None):
         except ValueError: abort(409,"This piece is no longer available")
         except StripeIntegrationError: abort(503,"Checkout is temporarily unavailable")
         checkout_orders=dict(session.get("checkout_orders") or {}); checkout_orders[sku]=order["public_id"]; session["checkout_orders"]=checkout_orders
-        destination=url_for("order_status",public_id=order["public_id"]) if cfg.stripe_fake_mode else provider_url
+        destination=url_for("order_status",public_id=order["public_id"]) if cfg.stripe_is_fake else provider_url
         return redirect(destination,code=303)
 
     @app.post("/stripe/webhook")
@@ -391,7 +390,7 @@ def create_app(config=None, http=None, stripe_adapter=None):
             app.logger.warning("Stripe webhook failure event_id=%s event_type=%s order=%s classification=%s",event_id,event_type,known,classification)
             db.finish_webhook(event_id,classification,claim["claim_token"]); return "",503
 
-    def fake_development_mode(): return cfg.stripe_fake_mode and cfg.environment != "production"
+    def fake_development_mode(): return cfg.stripe_is_fake and cfg.ebay_provider_mode != "production"
     def render_order(public_id, **context):
         response=make_response(render_template("order_status.html",order=db.public_order_status(public_id) or abort(404),fake_development_mode=fake_development_mode(),**context))
         response.headers.update({"Cache-Control":"private, no-store","X-Robots-Tag":"noindex, nofollow","Referrer-Policy":"no-referrer"})
@@ -662,7 +661,7 @@ def create_app(config=None, http=None, stripe_adapter=None):
     @app.post("/ebay/reconcile-orders")
     def reconcile_orders():
         try:
-            result=adapters()["ebay"].reconcile_orders() if not cfg.marketplace_mock_mode else {"processed":0,"duplicate":0,"unknown":0}
+            result=adapters()["ebay"].reconcile_orders() if not cfg.ebay_is_mock else {"processed":0,"duplicate":0,"unknown":0}
             flash(f"Order reconciliation complete: {result}","success")
         except EbayError as e: flash(str(e),"error")
         return redirect(url_for("ebay_settings"))
@@ -682,7 +681,7 @@ def create_app(config=None, http=None, stripe_adapter=None):
     def ebay_reconcile_cli(limit):
         """Reconcile a bounded batch after the environment activation contract passes."""
         limit=bounded(limit)
-        if cfg.marketplace_mock_mode: raise click.ClickException("eBay reconciliation requires a real target provider")
+        if cfg.ebay_is_mock: raise click.ClickException("eBay reconciliation requires a real target provider")
         try: summary=run_scheduled_job(db,adapters()["ebay"],cleanup=False,reconcile=True,limit=limit,lease_seconds=cfg.scheduled_job_lease_seconds,job_name="ebay-reconcile-orders")
         except Exception as exc:
             app.logger.error("eBay reconciliation failed: %s",type(exc).__name__)
@@ -737,7 +736,7 @@ def create_app(config=None, http=None, stripe_adapter=None):
         click.echo(json.dumps({"status":result["status"]},sort_keys=True))
     @app.route("/sandbox",methods=["GET","POST"])
     def sandbox():
-        if cfg.environment != "sandbox": abort(404)
+        if cfg.ebay_provider_mode != "sandbox": abort(404)
         oauth,_=real_components(); authenticated=False
         try: oauth.access_token(); authenticated=True
         except EbayError: pass
@@ -760,7 +759,7 @@ def create_app(config=None, http=None, stripe_adapter=None):
         return render_template("sandbox.html",cfg=cfg,authenticated=authenticated,setup=db.get_seller_setup(),values={},submitted_specifics={})
     @app.post("/sandbox/setup")
     def sandbox_setup():
-        if cfg.environment != "sandbox": abort(404)
+        if cfg.ebay_provider_mode != "sandbox": abort(404)
         oauth,service=real_components()
         try:
             oauth.access_token()  # Explicitly require an authenticated seller.

@@ -107,7 +107,7 @@ def test_second_setup_reuses_resources_without_opt_in_again(tmp_path):
 def test_environment_and_marketplace_guards(tmp_path):
     db = Database(str(tmp_path / "guard.sqlite")); db.migrate()
     with pytest.raises(EbayError):
-        SandboxSellerSetup(Config(environment="production"), db, FakeClient([])).run()
+        SandboxSellerSetup(Config(ebay_provider_mode="mock"), db, FakeClient([])).run()
     with pytest.raises(EbayError):
         SandboxSellerSetup(Config(environment="sandbox", marketplace_id="EBAY_GB"), db, FakeClient([])).run()
 

@@ -14,3 +14,14 @@ Launch prices are **tax-inclusive**, with **shipping included at a fixed $0.00**
 8. **Kill switches:** `CHECKOUT_ENABLED=false` and `EBAY_LISTING_ENABLED=false` block only new work. Keep the application, Stripe/eBay webhooks, refunds, withdrawals, reconciliation recovery, and scheduled reservation cleanup online.
 
 Production order reconciliation has one owner: the `/internal/scheduled-maintenance` Railway cron. Do not also run the CLI or seller UI scheduler for that environment. The cron has no volume and receives only `SCHEDULED_JOB_URL` and `SCHEDULED_JOB_TOKEN`.
+
+## Authoritative provider selection
+
+Set `STRIPE_PROVIDER_MODE` (`fake`, `test`, or `live`) and `EBAY_PROVIDER_MODE`
+(`mock`, `sandbox`, or `production`) together with the matching
+`APP_ENVIRONMENT`. These are the only provider selectors. The deprecated
+`STRIPE_FAKE_MODE`, `MARKETPLACE_MOCK_MODE`, and `EBAY_ENVIRONMENT` variables
+may be retained temporarily only when their values agree; startup rejects a
+conflict. `SELLER_USERNAME` is a bounded non-secret identifier, not a credential
+or entropy-bearing secret; continue protecting `SELLER_PASSWORD_HASH` and all
+provider keys.

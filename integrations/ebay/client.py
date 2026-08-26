@@ -73,7 +73,7 @@ def parse_upload_site_hosted_pictures(xml_content):
 class EbayClient:
     def __init__(self, config, oauth, session=None): self.cfg=config; self.oauth=oauth; self.http=session or requests.Session()
     @property
-    def base(self): return "https://api.sandbox.ebay.com" if self.cfg.environment=="sandbox" else "https://api.ebay.com"
+    def base(self): return "https://api.sandbox.ebay.com" if self.cfg.ebay_provider_mode=="sandbox" else "https://api.ebay.com"
     def order_page(self, *, limit, offset):
         """Fetch exactly one explicitly bounded fulfillment page."""
         if not isinstance(limit,int) or isinstance(limit,bool) or not 1 <= limit <= 200 or not isinstance(offset,int) or isinstance(offset,bool) or offset < 0:

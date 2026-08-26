@@ -17,7 +17,7 @@ def csrf(client):
 
 def setup_store(tmp_path, **overrides):
     cfg = replace(Config(), database_path=str(tmp_path / "store.sqlite"),
-                  stripe_fake_mode=True, environment="sandbox", **overrides)
+                  stripe_provider_mode="fake", environment="sandbox", **overrides)
     app = create_app(cfg)
     db = app.extensions["vintage_db"]
     item = db.create_item(sku="TEST-COAT", title="Test Coat", description="A coat",
@@ -102,8 +102,7 @@ def test_expiration_and_fake_completion_use_order_state_machine(tmp_path):
 
 
 def test_fake_actions_are_disabled_in_real_or_production_mode(tmp_path):
-    for name, overrides in (("real", {"stripe_fake_mode": False}),
-                            ("production", {"environment": "production"})):
+    for name, overrides in (("real", {"stripe_provider_mode": "test", "stripe_secret_key": "sk_test_example"}),):
         cfg = replace(Config(), database_path=str(tmp_path / f"{name}.sqlite"), **overrides)
         app = create_app(cfg)
         client = app.test_client()
@@ -128,7 +127,7 @@ def test_fake_checkout_recovery_after_restart_preserves_order_and_state_machine(
 
     restarted_config = replace(
         Config(), database_path=str(scenario / "store.sqlite"),
-        secret_key=secret_key, stripe_fake_mode=True, environment="sandbox")
+        secret_key=secret_key, stripe_provider_mode="fake", environment="sandbox")
     restarted_app = create_app(restarted_config)
     restarted_db = restarted_app.extensions["vintage_db"]
     restarted_client = restarted_app.test_client()

@@ -26,12 +26,12 @@ def test_item_page_and_sandbox_guard(tmp_path):
     app=create_app(cfg); db=app.extensions["vintage_db"]
     item=db.create_item(sku="S",title="Test",description="D",price="1",currency="USD",quantity=1,condition="3000",brand="B",size="M",color="C",category="1",photo_urls=["https://x.test/i"])
     response=app.test_client().get(f"/items/{item['id']}"); assert response.status_code==200 and b"eBay lifecycle" in response.data
-    assert create_app(Config(database_path=str(tmp_path/"prod.sqlite"),environment="production")).test_client().get("/sandbox").status_code==404
+    assert create_app(Config(database_path=str(tmp_path/"prod.sqlite"),ebay_provider_mode="mock")).test_client().get("/sandbox").status_code==404
 
 def test_routes_resolve_persisted_real_snapshot_and_local_mock(tmp_path):
     key=Fernet.generate_key().decode()
     cfg=Config(database_path=str(tmp_path/"modes.sqlite"),encryption_key=key,environment="sandbox",
-        marketplace_mock_mode=True,location_key="GLOBAL-CHANGED",fulfillment_policy_id="global-f",
+        ebay_provider_mode="mock",location_key="GLOBAL-CHANGED",fulfillment_policy_id="global-f",
         payment_policy_id="global-p",return_policy_id="global-r",marketplace_id="EBAY_GB")
     http=RecordingHTTP([RecordingHTTP.Response(),RecordingHTTP.Response()])
     app=create_app(cfg,http=http); db=app.extensions["vintage_db"]
@@ -65,7 +65,7 @@ def test_routes_resolve_persisted_real_snapshot_and_local_mock(tmp_path):
 
 def test_sandbox_creation_persists_normalized_seller_snapshot(tmp_path):
     cfg=Config(database_path=str(tmp_path/"sandbox-create.sqlite"),environment="sandbox",
-               marketplace_mock_mode=True,location_key="changed-global")
+               ebay_provider_mode="mock",location_key="changed-global")
     app=create_app(cfg); db=app.extensions["vintage_db"]
     db.save_seller_setup(None,"  fulfill  "," pay "," return "," location "," EBAY_US ")
     client=app.test_client()
@@ -83,7 +83,7 @@ def test_sandbox_creation_persists_normalized_seller_snapshot(tmp_path):
 
 def test_sandbox_creation_fails_closed_for_missing_or_incomplete_setup(tmp_path):
     app=create_app(Config(database_path=str(tmp_path/"sandbox-closed.sqlite"),environment="sandbox",
-                          marketplace_mock_mode=True))
+                          ebay_provider_mode="mock"))
     db=app.extensions["vintage_db"]; client=app.test_client()
     data={**csrf(client),"title":"Coat","description":"D","price":"10","condition":"USED_EXCELLENT",
           "category":"123","category_name":"","photo_url":"https://example.test/coat.jpg"}

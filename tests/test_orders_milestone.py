@@ -25,7 +25,7 @@ def test_real_checkout_is_card_only_manual_capture_and_collects_shipping(monkeyp
             captured.update(kwargs)
             return SimpleNamespace(id="cs_test_one", url="https://checkout.stripe.test/one", payment_intent=None)
     monkeypatch.setitem(sys.modules, "stripe", SimpleNamespace(checkout=SimpleNamespace(Session=Sessions)))
-    cfg = replace(Config(), stripe_fake_mode=False, stripe_secret_key="sk_test_example",
+    cfg = replace(Config(), stripe_provider_mode="test", stripe_secret_key="sk_test_example",
                   stripe_shipping_countries=("US", "CA"))
     result = StripeAdapter(cfg).create_checkout(
         {"public_id":"public","currency_snapshot":"USD","price_snapshot":"12.34"},
@@ -38,7 +38,7 @@ def test_real_checkout_is_card_only_manual_capture_and_collects_shipping(monkeyp
 
 
 def test_webhook_attaches_intent_sells_and_audits_without_public_pii(tmp_path):
-    cfg = replace(Config(), database_path=str(tmp_path/"db.sqlite"), stripe_fake_mode=True,
+    cfg = replace(Config(), database_path=str(tmp_path/"db.sqlite"), stripe_provider_mode="fake",
                   seller_username="seller", seller_password_hash=generate_password_hash("password"))
     app = create_app(cfg); db=app.extensions["vintage_db"]
     item=db.create_item(sku="AUDIT-1",title="Coat",description="",price="25.00",currency="USD",quantity=1,condition="Used",brand="",size="",color="",category="1",category_name="Coats")
@@ -59,7 +59,7 @@ def test_webhook_attaches_intent_sells_and_audits_without_public_pii(tmp_path):
 
 
 def test_refund_webhooks_reconcile_exact_full_refunds_without_creating_them(tmp_path):
-    cfg = replace(Config(), database_path=str(tmp_path/"refund-webhooks.sqlite"), stripe_fake_mode=True)
+    cfg = replace(Config(), database_path=str(tmp_path/"refund-webhooks.sqlite"), stripe_provider_mode="fake")
     app=create_app(cfg); db=app.extensions["vintage_db"]; stripe=app.extensions["stripe_adapter"]
     item=db.create_item(sku="REFUND-1",title="Coat",description="",price="25.00",currency="USD",quantity=1,condition="Used",brand="",size="",color="",category="1",category_name="Coats")
     db.update_item(item["id"],status="Active",storefront_visible=1)
@@ -98,7 +98,7 @@ def test_identifiable_mismatched_refund_is_manual_review_and_charge_needs_refund
         "refunds":{"data":[{"id":"re_one","amount":1000,"status":"succeeded"}]}})==[
             {"id":"re_one","payment_intent":"pi_one","amount":1000,"currency":"usd",
              "status":"succeeded","reference":None}]
-    cfg=replace(Config(),database_path=str(tmp_path/"refund-review.sqlite"),stripe_fake_mode=True)
+    cfg=replace(Config(),database_path=str(tmp_path/"refund-review.sqlite"),stripe_provider_mode="fake")
     app=create_app(cfg); db=app.extensions["vintage_db"]; client=app.test_client()
     item=db.create_item(sku="REFUND-2",title="Coat",description="",price="10",currency="USD",quantity=1,condition="Used",brand="",size="",color="",category="1",category_name="Coats")
     db.update_item(item["id"],status="Active",storefront_visible=1)
@@ -174,6 +174,6 @@ def test_retrieve_session_wraps_sdk_failures_without_raw_details(monkeypatch):
         def retrieve(*args,**kwargs): raise InvalidRequestError("sk_test_secret raw customer")
     monkeypatch.setitem(sys.modules,"stripe",SimpleNamespace(checkout=SimpleNamespace(Session=Sessions)))
     with pytest.raises(StripeIntegrationError) as caught:
-        StripeAdapter(replace(Config(),stripe_fake_mode=False,stripe_secret_key="sk_test_example")).retrieve_session("session")
+        StripeAdapter(replace(Config(),stripe_provider_mode="test",stripe_secret_key="sk_test_example")).retrieve_session("session")
     assert caught.value.kind=="session_not_found" and not caught.value.ambiguous
     assert "secret" not in str(caught.value)
