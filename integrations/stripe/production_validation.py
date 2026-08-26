@@ -9,6 +9,8 @@ class ProductionStripeValidator:
     def validate(self):
         if self.cfg.stripe_provider_mode != "live" or not self.cfg.stripe_secret_key.startswith("sk_live_"):
             raise StripeIntegrationError("configuration","Stripe validation requires live mode",ambiguous=False)
+        if not isinstance(self.cfg.expected_stripe_account_id,str) or not self.cfg.expected_stripe_account_id.strip():
+            raise StripeIntegrationError("configuration","Expected Stripe account identity is required",ambiguous=False)
         try:
             if self.retriever:
                 account=self.retriever(self.cfg.stripe_secret_key)

@@ -8,7 +8,9 @@ class FakeStripeAdapter:
     def create_checkout(self, order, item, success_url, cancel_url):
         self.calls.append({"order":order["public_id"],"amount":order["price_snapshot"],"currency":order["currency_snapshot"],"quantity":1,"name":item["title"]})
         sid="cs_test_"+order["public_id"][:16]; pi="pi_test_"+order["public_id"][:16]
-        result={"id":sid,"payment_intent":pi,"url":f"/shop/order/{order['public_id']}"}; self.sessions[sid]=result
+        result={"id":sid,"payment_intent":pi,"url":f"/shop/order/{order['public_id']}",
+            "shipping_details":{"address":{"country":self.cfg.commerce_supported_countries[0]}}}
+        self.sessions[sid]=result
         amount=validate_cents(order["final_total_amount"],"final_total_amount")
         self.payment_intents[pi]={"id":pi,"status":"requires_capture","capture_method":"manual",
             "amount":amount,"amount_capturable":amount,"amount_received":0,"currency":order["currency_snapshot"].upper()}
