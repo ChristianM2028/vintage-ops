@@ -18,6 +18,8 @@ class OrderService:
         self.db, self.stripe, self.ebay_resolver, self.cfg = db, stripe, ebay_resolver, config
 
     def create_checkout(self, sku, prior_id=None):
+        if not self.cfg.checkout_enabled:
+            raise StripeIntegrationError("checkout_disabled","New checkouts are temporarily disabled")
         prior = self.db.get_order(prior_id) if prior_id else None
         active=getattr(self.stripe,"identity","fake" if self.cfg.stripe_fake_mode else "stripe_test")
         if prior and prior.get("stripe_provider_identity") not in (None,active):
@@ -37,7 +39,7 @@ class OrderService:
                     self.db.transition_order(prior["public_id"],"manual_resolution",error=json.dumps(exc.safe_dict()),source="shopper",category="stale_session_review")
                     raise
         identity=getattr(self.stripe,"identity","fake" if self.cfg.stripe_fake_mode else "stripe_test")
-        order = self.db.create_storefront_order(sku, self.cfg.reservation_seconds, identity)
+        order = self.db.create_storefront_order(sku, self.cfg.reservation_seconds, identity, {"shipping_amount":self.cfg.stripe_shipping_amount,"tax_amount":self.cfg.stripe_tax_amount})
         item = self.db.get_item(order["item_id"])
         try:
             remote = self.stripe.create_checkout(
@@ -89,6 +91,15 @@ class OrderService:
         capture_method = _value(payment_intent, "capture_method")
         if status != "requires_capture" or capture_method != "manual":
             return order  # premature/irrelevant delivery is safely recorded by webhook dedupe
+        amount=_value(payment_intent,"amount"); currency=str(_value(payment_intent,"currency","") or "").upper()
+        if session_obj is None:
+            session_obj=self.stripe.retrieve_session(order["stripe_checkout_session_id"])
+        fulfillment=self._fulfillment(session_obj)
+        country=str(fulfillment.get("shipping_country") or "").upper(); state=str(fulfillment.get("shipping_state") or "").upper()
+        if amount != order["final_total_amount"] or currency != order["currency_snapshot"].upper():
+            return self.db.transition_order(order["public_id"],"manual_resolution",error='{"kind":"amount_currency_mismatch"}',source=source,category="payment_mismatch")
+        if country not in self.cfg.stripe_shipping_countries or (country=="US" and state not in self.cfg.stripe_shipping_states):
+            return self._cancel_and_release(order["public_id"],"unavailable","unsupported destination",source)
         if order["state"] in ("checkout_pending", "authorization_pending"):
             try: order = self.db.transition_order(order["public_id"], "authorized", payment_state="authorized", source=source, category="authorization_verified")
             except ValueError: order=self.db.get_order(order["public_id"])

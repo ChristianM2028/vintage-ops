@@ -1,0 +1,9 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+[deploy]
+startCommand = "python scripts/run_scheduled_job.py"
+cronSchedule = "*/5 * * * *"
+restartPolicyType = "NEVER"
+# Dedicated cron service: mount no volume. Configure only SCHEDULED_JOB_URL and
+# SCHEDULED_JOB_TOKEN for exactly one target environment in Railway.

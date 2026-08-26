@@ -2,4 +2,4 @@
 {{order.shipping_line1}}{% if order.shipping_line2 %}
 {{order.shipping_line2}}{% endif %}
 {{order.shipping_city}}{% if order.shipping_state %}, {{order.shipping_state}}{% endif %} {{order.shipping_postal_code}}
-{{order.shipping_country}}</address><table class="item"><thead><tr><th>Item</th><th>SKU</th><th>Quantity</th></tr></thead><tbody><tr><td>{{order.title}}</td><td>{{order.sku}}</td><td>1</td></tr></tbody></table></body></html>
+{{order.shipping_country}}</address><table class="item"><thead><tr><th>Item</th><th>SKU</th><th>Quantity</th></tr></thead><tbody><tr><td>{{order.title}}</td><td>{{order.sku}}</td><td>1</td></tr></tbody></table><p>Shipping and tax were included in the final total of {{'%.2f'|format(order.final_total_amount / 100)}} {{order.currency_snapshot}}.</p></body></html>

@@ -21,6 +21,10 @@ class EbayService:
     def _offer(self,item):
         return {"sku":item["ebay_sku"],"marketplaceId":self.cfg.marketplace_id,"format":"FIXED_PRICE","availableQuantity":item["quantity"],"categoryId":item.get("category") or self.cfg.category_id,"merchantLocationKey":self.cfg.location_key,"listingDescription":item["description"],"pricingSummary":{"price":{"value":str(item["price"]),"currency":item["currency"]}},"listingPolicies":{"fulfillmentPolicyId":self.cfg.fulfillment_policy_id,"paymentPolicyId":self.cfg.payment_policy_id,"returnPolicyId":self.cfg.return_policy_id}}
     def listItem(self,item):
+        if not getattr(self.cfg,"ebay_listing_enabled",True): raise EbayError("listing_disabled","New listings are temporarily disabled")
+        if self.cfg.environment=="production":
+            from .production_validation import require_production_activation
+            require_production_activation(self.cfg,self.db,self.cfg.expected_ebay_seller_id)
         self._prereqs(item)
         lock=self.db.acquire_publication_lock(item["id"])
         if not lock: raise EbayError("conflict","Another publication is already in progress; wait and synchronize")
@@ -108,6 +112,9 @@ class EbayService:
             "withdrawn" if status in ("WITHDRAWN","ENDED") else "ambiguous")
         return {"classification":classification,"offer_id":offer,"listing_id":listing or item.get("ebay_listing_id"),"status":status or None}
     def reconcile_orders(self,max_orders=None):
+        if self.cfg.environment=="production":
+            from .production_validation import require_production_activation
+            require_production_activation(self.cfg,self.db,self.cfg.expected_ebay_seller_id)
         maximum=min(max_orders if max_orders is not None else self.cfg.ebay_order_max_orders,self.cfg.ebay_order_max_orders)
         if not isinstance(maximum,int) or isinstance(maximum,bool) or maximum < 1: raise ValueError("max_orders must be positive")
         counts={"processed":0,"duplicate":0,"unknown":0,"pages_fetched":0}
