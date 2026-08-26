@@ -467,7 +467,13 @@ order/line identifiers prevent duplicate cleanup and inventory decrements.
 
 ## Explicit non-goals
 
-The current scope intentionally excludes:
+The current launch scope intentionally excludes the following capabilities.
+They must not be folded into production provider activation. Their independent,
+post-stability delivery sequence, security/privacy gates, lifecycle boundaries,
+and acceptance criteria are defined in
+[`docs/POST_LAUNCH_MILESTONES.md`](docs/POST_LAUNCH_MILESTONES.md).
+
+Until the corresponding milestone is explicitly started, the scope excludes:
 
 * shipping-label purchase or generation;
 * carrier API integrations and automatic delivery detection;
