@@ -1,6 +1,8 @@
 import tomllib
 from dataclasses import replace
+from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 from flask import url_for
@@ -8,6 +10,20 @@ from werkzeug.security import generate_password_hash
 
 from app import create_app
 from config import Config
+
+
+class StylesheetParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.stylesheets=[]
+        self.style_blocks=0
+
+    def handle_starttag(self, tag, attrs):
+        attributes=dict(attrs)
+        if tag == "link" and "stylesheet" in attributes.get("rel", "").split():
+            self.stylesheets.append(attributes.get("href", ""))
+        elif tag == "style":
+            self.style_blocks += 1
 
 
 def deployment_config(tmp_path, **overrides):
@@ -96,6 +112,25 @@ def test_health_is_public_and_non_sensitive(tmp_path):
     assert response.status_code==200
     assert response.get_json()=={"status":"ok"}
     assert b"secret" not in response.data and b"sqlite" not in response.data
+
+
+def test_seller_stylesheet_is_same_origin_and_csp_compatible(tmp_path):
+    client=create_app(deployment_config(tmp_path)).test_client()
+    page=client.get("/login")
+    parser=StylesheetParser(); parser.feed(page.text)
+
+    assert page.status_code == 200
+    assert parser.stylesheets == ["/static/seller.css"]
+    stylesheet_url=urlsplit(parser.stylesheets[0])
+    assert stylesheet_url.scheme == "" and stylesheet_url.netloc == ""
+    assert not parser.stylesheets[0].startswith("http://")
+    assert parser.style_blocks == 0
+    assert "style-src 'self'" in page.headers["Content-Security-Policy"]
+
+    stylesheet=client.get(parser.stylesheets[0])
+    assert stylesheet.status_code == 200
+    assert stylesheet.content_type == "text/css; charset=utf-8"
+    assert b".inventory-row" in stylesheet.data
 
 
 def _origin_app(tmp_path, **values):
