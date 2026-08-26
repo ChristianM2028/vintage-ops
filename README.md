@@ -45,7 +45,7 @@ an owner, expiry, and compensating control for any time-bounded exception.
 
 > **Sandbox only:** this checked-in Railway configuration must never be used with
 > live Stripe credentials or production eBay. Use only `sk_test_` Stripe keys and
-> keep `EBAY_ENVIRONMENT=sandbox`; the reconciliation command refuses production.
+> keep `EBAY_PROVIDER_MODE=sandbox`; the reconciliation command refuses production.
 
 Provision one persistent Railway volume mounted at `/data`. The checked-in
 configuration fixes `DATABASE_PATH=/data/vintage_ops.sqlite3` and
@@ -57,10 +57,10 @@ deployment), four threads, a 60-second timeout, and a 30-second graceful timeout
 Configure these Railway variables/secrets: a strong random `FLASK_SECRET_KEY`, a
 stable Fernet `TOKEN_ENCRYPTION_KEY`, `SELLER_USERNAME`, a Werkzeug-generated
 `SELLER_PASSWORD_HASH`, `SESSION_COOKIE_SECURE=true`, `PROXY_FIX_PROTO=1`,
-`PROXY_FIX_HOST=1`, `EBAY_ENVIRONMENT=sandbox`, Sandbox-only `EBAY_CLIENT_ID`,
+`PROXY_FIX_HOST=1`, `EBAY_PROVIDER_MODE=sandbox`, Sandbox-only `EBAY_CLIENT_ID`,
 `EBAY_CLIENT_SECRET`, `EBAY_RUNAME`, and `EBAY_CALLBACK_URL`, plus the applicable
-marketplace/location/policy settings. Set `MARKETPLACE_MOCK_MODE=false`. For
-Stripe use only `STRIPE_FAKE_MODE=false`, an `sk_test_...` `STRIPE_SECRET_KEY`,
+marketplace/location/policy settings. Set `EBAY_PROVIDER_MODE=sandbox`. For
+Stripe use only `STRIPE_PROVIDER_MODE=test`, an `sk_test_...` `STRIPE_SECRET_KEY`,
 `STRIPE_WEBHOOK_SECRET`, and public HTTPS `STRIPE_SUCCESS_URL` and
 `STRIPE_CANCEL_URL` values containing `{ORDER_ID}`. Keep every credential in
 Railway secrets, never deployment files.
@@ -135,9 +135,9 @@ make migrate
 make run
 ```
 
-The example defaults to `MARKETPLACE_MOCK_MODE=true`. Visit `/` to create an item with local photos, then use `/inventory` to list or delist it against the network-free mock. Uploaded media lives in `instance/uploads`; its directory, per-file size limit, extensions, and photo-count limit are configurable with `UPLOAD_DIRECTORY`, `MAX_UPLOAD_SIZE`, `PERMITTED_IMAGE_EXTENSIONS`, and `MAX_PHOTO_COUNT`. `.env`, uploaded media, SQLite databases, and all of `instance/` remain ignored.
+The example defaults to `EBAY_PROVIDER_MODE=mock`. Visit `/` to create an item with local photos, then use `/inventory` to list or delist it against the network-free mock. Uploaded media lives in `instance/uploads`; its directory, per-file size limit, extensions, and photo-count limit are configurable with `UPLOAD_DIRECTORY`, `MAX_UPLOAD_SIZE`, `PERMITTED_IMAGE_EXTENSIONS`, and `MAX_PHOTO_COUNT`. `.env`, uploaded media, SQLite databases, and all of `instance/` remain ignored.
 
-Set `MARKETPLACE_MOCK_MODE=false` only when you intend to use the preserved real eBay OAuth/Inventory API flow below. Local uploads are intentionally not public HTTPS URLs, so real publication rejects them. Use the secondary `/sandbox` development route with a suitable externally reachable HTTPS photo URL when exercising real eBay Sandbox.
+Set `EBAY_PROVIDER_MODE=sandbox` only when you intend to use the preserved real eBay OAuth/Inventory API flow below. Local uploads are intentionally not public HTTPS URLs, so real publication rejects them. Use the secondary `/sandbox` development route with a suitable externally reachable HTTPS photo URL when exercising real eBay Sandbox.
 
 Generate secrets rather than copying the development fallback:
 
@@ -152,14 +152,14 @@ Put those values in `FLASK_SECRET_KEY` and `TOKEN_ENCRYPTION_KEY`. The latter mu
 
 1. Create Sandbox keys and a Sandbox seller in the [eBay Developer Program](https://developer.ebay.com/signin?tab=register).
 2. In **User Tokens**, add an eBay sign-in redirect URL. eBay calls its redirect identifier the **RuName**. Set `EBAY_RUNAME` to that identifier, and configure its accepted URL to exactly match `EBAY_CALLBACK_URL` (normally `http://127.0.0.1:5000/ebay/callback`). Set Sandbox App ID/Cert ID as `EBAY_CLIENT_ID`/`EBAY_CLIENT_SECRET`.
-3. Keep `EBAY_ENVIRONMENT=sandbox`. Visit `/sandbox` and click **Authorize Sandbox seller**. The app requests `sell.inventory`, `sell.account`, and the base OAuth scope. Random state is hashed in SQLite, expires after ten minutes, is single-use, and is validated before the code exchange.
+3. Keep `EBAY_PROVIDER_MODE=sandbox`. Visit `/sandbox` and click **Authorize Sandbox seller**. The app requests `sell.inventory`, `sell.account`, and the base OAuth scope. Random state is hashed in SQLite, expires after ten minutes, is single-use, and is validated before the code exchange.
 4. Tokens are exchanged and refreshed only server-side. Refresh and short-lived access tokens are Fernet-encrypted at rest. A revoked/invalid refresh token produces a reauthorization instruction. Credentials, codes, and tokens are never rendered or logged.
 
 See eBay's official [authorization-code grant](https://developer.ebay.com/api-docs/static/oauth-authorization-code-grant.html), [OAuth scopes](https://developer.ebay.com/api-docs/static/oauth-scopes.html), and [token endpoint](https://developer.ebay.com/api-docs/static/oauth-token-types.html) documentation.
 
 ## Automatic Sandbox seller setup
 
-After authorizing the Sandbox seller, open `/sandbox` and click **Set up Sandbox seller**. The setup is deliberately restricted to `EBAY_ENVIRONMENT=sandbox` and `EBAY_US`. It uses the seller OAuth grant to:
+After authorizing the Sandbox seller, open `/sandbox` and click **Set up Sandbox seller**. The setup is deliberately restricted to `EBAY_PROVIDER_MODE=sandbox` and `EBAY_US`. It uses the seller OAuth grant to:
 
 * inspect the Account API `SELLING_POLICY_MANAGEMENT` privilege and opt in only when needed;
 * reuse distinctively named Vintage Ops fulfillment, payment, and return policies, or create sensible Sandbox defaults and confirm them by querying again; and
@@ -200,7 +200,7 @@ The development lifecycle route returns 404 outside Sandbox, preventing this tes
 
 ## Production eBay checklist
 
-Production requires a separate production keyset and an authorized production seller. Configure the production App ID as `EBAY_CLIENT_ID`, production Cert ID as `EBAY_CLIENT_SECRET`, the registered OAuth redirect identifier (RuName) as `EBAY_RUNAME`, and its **exact registered callback URL** as `EBAY_CALLBACK_URL`. Set `EBAY_ENVIRONMENT=production` and `MARKETPLACE_MOCK_MODE=false`. Keep stable, randomly generated `FLASK_SECRET_KEY` and Fernet `TOKEN_ENCRYPTION_KEY` values.
+Production requires a separate production keyset and an authorized production seller. Configure the production App ID as `EBAY_CLIENT_ID`, production Cert ID as `EBAY_CLIENT_SECRET`, the registered OAuth redirect identifier (RuName) as `EBAY_RUNAME`, and its **exact registered callback URL** as `EBAY_CALLBACK_URL`. Set `EBAY_PROVIDER_MODE=production` and `EBAY_PROVIDER_MODE=sandbox`. Keep stable, randomly generated `FLASK_SECRET_KEY` and Fernet `TOKEN_ENCRYPTION_KEY` values.
 
 Set `EBAY_MARKETPLACE_ID` and `EBAY_CURRENCY`, an enabled `EBAY_MERCHANT_LOCATION_KEY`, and fulfillment, payment, and return policy IDs owned by the same seller and marketplace. The seller must have production selling privileges, be enrolled in Business Policies, and authorize the base, Inventory, Account, and Fulfillment scopes. Existing grants made before Fulfillment was added must be reauthorized.
 
@@ -336,7 +336,7 @@ the complete hash, including its `scrypt:` prefix and every `$`-delimited sectio
 and never store a plaintext password. A malformed configured hash is treated as
 an authentication configuration failure without displaying the hash or password.
 Set `SELLER_USERNAME`, a strong `FLASK_SECRET_KEY`,
-and enable `SESSION_COOKIE_SECURE` behind HTTPS. Set `STRIPE_FAKE_MODE=true` for
+and enable `SESSION_COOKIE_SECURE` behind HTTPS. Set `STRIPE_PROVIDER_MODE=fake` for
 network-free development. Production uses `STRIPE_SECRET_KEY`,
 `STRIPE_WEBHOOK_SECRET`, HTTPS success/cancel URLs, plus the existing eBay
 credentials. Browser submissions never determine amount, currency, quantity,
@@ -377,7 +377,7 @@ feature.
 ## Stripe sandbox checkout procedure
 
 1. Create or select a Stripe sandbox and obtain its `sk_test_` secret key.
-2. Set `STRIPE_FAKE_MODE=false`, set `STRIPE_SECRET_KEY` to that test key, and
+2. Set `STRIPE_PROVIDER_MODE=test`, set `STRIPE_SECRET_KEY` to that test key, and
    configure `STRIPE_SHIPPING_COUNTRIES` (the example defaults to `US`). Live
    `sk_live_` keys are rejected at startup.
 3. Run exactly one Stripe listener, connected to the same sandbox/account as
@@ -533,3 +533,7 @@ The command verifies the encrypted download, authenticates it, validates every
 archive member, manifest/photo inventory, and SQLite integrity, then atomically
 publishes the destination. Review the output and perform any production change
 manually; the command never restarts the app or overwrites `/data`.
+
+### Deprecated provider aliases
+
+`STRIPE_FAKE_MODE`, `MARKETPLACE_MOCK_MODE`, and `EBAY_ENVIRONMENT` are deprecated compatibility inputs. Do not use them to select providers; when explicitly set, startup verifies that they agree with `STRIPE_PROVIDER_MODE` or `EBAY_PROVIDER_MODE`. `SELLER_USERNAME` is a bounded, non-secret identifier (1–64 allowed identifier characters), while `SELLER_PASSWORD_HASH` and provider credentials remain secrets.

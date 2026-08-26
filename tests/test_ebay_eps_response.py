@@ -51,7 +51,7 @@ class TradingClient:
 
 def make_item(tmp_path):
     cfg = replace(Config(), database_path=str(tmp_path / "db.sqlite"), upload_directory=str(tmp_path / "uploads"),
-                  marketplace_mock_mode=False, ebay_image_upload_api="trading")
+                  ebay_provider_mode="sandbox", ebay_image_upload_api="trading")
     db = Database(cfg.database_path)
     db.migrate()
     Path(cfg.upload_directory).mkdir()

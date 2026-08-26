@@ -3,8 +3,7 @@ from .errors import StripeIntegrationError
 class StripeAdapter:
     def __init__(self, config):
         self.cfg=config
-        mode=config.stripe_provider_mode or ("fake" if config.stripe_fake_mode else "test")
-        self.identity="stripe_live" if mode=="live" else "stripe_test"
+        self.identity=config.stripe_identity
     def create_checkout(self, order, item, success_url, cancel_url):
         import stripe
         try:

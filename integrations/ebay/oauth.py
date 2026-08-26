@@ -16,9 +16,9 @@ class OAuthManager:
         keys=([config.encryption_key]+list(config.historical_encryption_keys)) if config.encryption_key else []
         self.fernet=MultiFernet([Fernet(key.encode()) for key in keys]) if keys else None
     @property
-    def identity_base(self): return "https://auth.sandbox.ebay.com" if self.cfg.environment=="sandbox" else "https://auth.ebay.com"
+    def identity_base(self): return "https://auth.sandbox.ebay.com" if self.cfg.ebay_provider_mode=="sandbox" else "https://auth.ebay.com"
     @property
-    def api_base(self): return "https://api.sandbox.ebay.com" if self.cfg.environment=="sandbox" else "https://api.ebay.com"
+    def api_base(self): return "https://api.sandbox.ebay.com" if self.cfg.ebay_provider_mode=="sandbox" else "https://api.ebay.com"
     def _require_crypto(self):
         if not self.fernet: raise EbayError("configuration","TOKEN_ENCRYPTION_KEY is required; generate a Fernet key")
     def begin(self):

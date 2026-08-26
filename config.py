@@ -16,11 +16,17 @@ def env_bool(name, default=True):
         return default
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
+_STRIPE_MODE_DEFAULT = os.getenv("STRIPE_PROVIDER_MODE", "fake").strip().lower()
+_EBAY_MODE_DEFAULT = os.getenv("EBAY_PROVIDER_MODE", "mock").strip().lower()
+_STRIPE_FAKE_EXPLICIT = "STRIPE_FAKE_MODE" in os.environ
+_MARKETPLACE_MOCK_EXPLICIT = "MARKETPLACE_MOCK_MODE" in os.environ
+_EBAY_ENVIRONMENT_EXPLICIT = "EBAY_ENVIRONMENT" in os.environ
+
 @dataclass(frozen=True)
 class Config:
     app_environment: str = os.getenv("APP_ENVIRONMENT", "local").strip().lower()
-    stripe_provider_mode: str = os.getenv("STRIPE_PROVIDER_MODE", "").strip().lower()
-    ebay_provider_mode: str = os.getenv("EBAY_PROVIDER_MODE", "").strip().lower()
+    stripe_provider_mode: str = _STRIPE_MODE_DEFAULT
+    ebay_provider_mode: str = _EBAY_MODE_DEFAULT
     canonical_origin: str = os.getenv("CANONICAL_ORIGIN", "").strip()
     production_provider_activation_id: str = os.getenv("PRODUCTION_PROVIDER_ACTIVATION_ID", "").strip()
     expected_stripe_account_id: str = os.getenv("EXPECTED_STRIPE_ACCOUNT_ID", "").strip()
@@ -40,9 +46,9 @@ class Config:
     payment_policy_id: str = os.getenv("EBAY_PAYMENT_POLICY_ID", "")
     return_policy_id: str = os.getenv("EBAY_RETURN_POLICY_ID", "")
     category_id: str = os.getenv("EBAY_CATEGORY_ID", "")
-    environment: str = os.getenv("EBAY_ENVIRONMENT", "sandbox")
+    environment: str = os.getenv("EBAY_ENVIRONMENT", "production" if _EBAY_MODE_DEFAULT == "production" else "sandbox").strip().lower()
     timeout: float = float(os.getenv("EBAY_TIMEOUT_SECONDS", "15"))
-    marketplace_mock_mode: bool = env_bool("MARKETPLACE_MOCK_MODE", True)
+    marketplace_mock_mode: bool = env_bool("MARKETPLACE_MOCK_MODE", _EBAY_MODE_DEFAULT == "mock")
     upload_directory: str = os.getenv("UPLOAD_DIRECTORY", "instance/uploads")
     backup_directory: str = os.getenv("BACKUP_DIRECTORY", "instance/backups")
     backup_encryption_key: str = os.getenv("BACKUP_ENCRYPTION_KEY", "")
@@ -74,7 +80,7 @@ class Config:
     stripe_webhook_secret: str = os.getenv("STRIPE_WEBHOOK_SECRET", "development-webhook-secret")
     stripe_success_url: str = os.getenv("STRIPE_SUCCESS_URL", "http://127.0.0.1:5000/shop/order/{ORDER_ID}/success")
     stripe_cancel_url: str = os.getenv("STRIPE_CANCEL_URL", "http://127.0.0.1:5000/shop/order/{ORDER_ID}/cancel")
-    stripe_fake_mode: bool = env_bool("STRIPE_FAKE_MODE", True)
+    stripe_fake_mode: bool = env_bool("STRIPE_FAKE_MODE", _STRIPE_MODE_DEFAULT == "fake")
     rate_limit_storage_uri: str = os.getenv("RATE_LIMIT_STORAGE_URI", "memory://")
     login_rate_limit: str = os.getenv("LOGIN_RATE_LIMIT", "5 per minute")
     checkout_ip_rate_limit: str = os.getenv("CHECKOUT_IP_RATE_LIMIT", "20 per hour")
@@ -105,17 +111,24 @@ class Config:
     def __post_init__(self):
         if self.app_environment not in {"local","sandbox","production"}:
             raise ValueError("APP_ENVIRONMENT must be local, sandbox, or production")
-        stripe_mode=self.stripe_provider_mode or ("fake" if self.stripe_fake_mode else "test")
-        ebay_mode=self.ebay_provider_mode or ("mock" if self.marketplace_mock_mode else self.environment)
-        if stripe_mode not in {"fake","test","live"}: raise ValueError("Unknown Stripe provider mode")
-        if ebay_mode not in {"mock","sandbox","production"}: raise ValueError("Unknown eBay provider mode")
+        stripe_mode=self.stripe_provider_mode
+        ebay_mode=self.ebay_provider_mode
+        if stripe_mode not in {"fake","test","live"}: raise ValueError("STRIPE_PROVIDER_MODE must be fake, test, or live")
+        if ebay_mode not in {"mock","sandbox","production"}: raise ValueError("EBAY_PROVIDER_MODE must be mock, sandbox, or production")
+        if _STRIPE_FAKE_EXPLICIT and self.stripe_fake_mode != (stripe_mode == "fake"):
+            raise ValueError("STRIPE_FAKE_MODE conflicts with STRIPE_PROVIDER_MODE")
+        if _MARKETPLACE_MOCK_EXPLICIT and self.marketplace_mock_mode != (ebay_mode == "mock"):
+            raise ValueError("MARKETPLACE_MOCK_MODE conflicts with EBAY_PROVIDER_MODE")
+        expected_endpoint = "production" if ebay_mode == "production" else "sandbox"
+        if (_EBAY_ENVIRONMENT_EXPLICIT or self.environment != expected_endpoint) and self.environment != expected_endpoint:
+            raise ValueError("EBAY_ENVIRONMENT conflicts with EBAY_PROVIDER_MODE")
         allowed={"local":({"fake","test"},{"mock","sandbox"}),"sandbox":({"fake","test"},{"mock","sandbox"}),"production":({"live"},{"production"})}
         if stripe_mode not in allowed[self.app_environment][0] or ebay_mode not in allowed[self.app_environment][1]:
             raise ValueError("Provider modes do not match APP_ENVIRONMENT")
         key=self.stripe_secret_key.strip()
         if stripe_mode=="live" and not key.startswith("sk_live_"): raise ValueError("Stripe live mode requires an sk_live_ key")
-        if stripe_mode=="test" and (self.stripe_provider_mode or self.app_environment!="local") and not key.startswith("sk_test_"): raise ValueError("Stripe test mode requires an sk_test_ key")
-        if self.stripe_provider_mode and stripe_mode=="fake" and key.startswith(("sk_live_","sk_test_")): raise ValueError("Stripe fake mode cannot contain a provider key")
+        if stripe_mode=="test" and not key.startswith("sk_test_"): raise ValueError("Stripe test mode requires an sk_test_ key")
+        if stripe_mode=="fake" and key.startswith(("sk_live_","sk_test_")): raise ValueError("Stripe fake mode cannot contain a provider key")
         if stripe_mode!="live" and key.startswith("sk_live_"): raise ValueError("Live Stripe keys require validated production mode")
         if self.stripe_shipping_amount < 0 or self.stripe_tax_amount < 0: raise ValueError("Pricing amounts cannot be negative")
         if not self.stripe_shipping_states: raise ValueError("At least one supported shipping state is required")
@@ -165,9 +178,16 @@ class Config:
         def strong(name,value,minimum=32):
             if not value or len(value.strip())<minimum or value.strip().lower() in placeholders or "placeholder" in value.lower():
                 raise ValueError(f"{name} must be a non-placeholder high-entropy value")
+        if self.seller_username:
+            # Seller usernames are bounded identifiers, not high-entropy secrets.
+            if (self.seller_username != self.seller_username.strip() or len(self.seller_username) > 64
+                    or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._@+-]*", self.seller_username)):
+                raise ValueError("SELLER_USERNAME must be a non-empty identifier of at most 64 characters using letters, digits, . _ @ + or -")
         if strict:
+            if not self.seller_username:
+                raise ValueError("SELLER_USERNAME must be a non-empty identifier of at most 64 characters using letters, digits, . _ @ + or -")
             for name,value in (("FLASK_SECRET_KEY",self.secret_key),("STRIPE_WEBHOOK_SECRET",self.stripe_webhook_secret),
-                ("SELLER_USERNAME",self.seller_username),("SELLER_PASSWORD_HASH",self.seller_password_hash),
+                ("SELLER_PASSWORD_HASH",self.seller_password_hash),
                 ("SCHEDULED_JOB_TOKEN",self.scheduled_job_token),("BACKUP_SCHEDULED_JOB_TOKEN",self.backup_scheduled_job_token),
                 ("TOKEN_ENCRYPTION_KEY",self.encryption_key),("BACKUP_ENCRYPTION_KEY",self.backup_encryption_key),("SESSION_GENERATION",self.session_generation)):
                 strong(name,value,8 if name=="SELLER_USERNAME" else 32)
@@ -192,3 +212,19 @@ class Config:
             if not self.rate_limit_storage_uri or self.rate_limit_storage_uri=="memory://": raise ValueError("Production requires a shared rate-limit store")
             for name,path in (("DATABASE_PATH",self.database_path),("UPLOAD_DIRECTORY",self.upload_directory),("BACKUP_DIRECTORY",self.backup_directory)):
                 if not Path(path).is_absolute() or not str(Path(path)).startswith("/data/"): raise ValueError(f"{name} must be a production persistent path")
+
+    @property
+    def stripe_identity(self):
+        return {"fake": "fake", "test": "stripe_test", "live": "stripe_live"}[self.stripe_provider_mode]
+
+    @property
+    def ebay_integration_identity(self):
+        return {"mock": "local_mock", "sandbox": "ebay_sandbox", "production": "ebay_production"}[self.ebay_provider_mode]
+
+    @property
+    def stripe_is_fake(self):
+        return self.stripe_provider_mode == "fake"
+
+    @property
+    def ebay_is_mock(self):
+        return self.ebay_provider_mode == "mock"

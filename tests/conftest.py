@@ -17,7 +17,7 @@ def order_factory(tmp_path):
         counter += 1
         cfg = replace(
             Config(), database_path=str(tmp_path / f"orders-{counter}.sqlite"),
-            stripe_fake_mode=True, environment="sandbox",
+            stripe_provider_mode="fake", environment="sandbox",
             seller_username="seller" if authenticated else "",
             seller_password_hash=(generate_password_hash("secret-password")
                                   if authenticated else ""),

@@ -30,7 +30,7 @@ class Client:
         return value
 
 def make(tmp_path):
-    cfg=Config(database_path=str(tmp_path/'db'),upload_directory=str(tmp_path/'uploads'),encryption_key=Fernet.generate_key().decode(),client_id='id',client_secret='secret',runame='name',location_key='loc',fulfillment_policy_id='f',payment_policy_id='p',return_policy_id='r',category_id='1',marketplace_mock_mode=False)
+    cfg=Config(database_path=str(tmp_path/'db'),upload_directory=str(tmp_path/'uploads'),encryption_key=Fernet.generate_key().decode(),client_id='id',client_secret='secret',runame='name',location_key='loc',fulfillment_policy_id='f',payment_policy_id='p',return_policy_id='r',category_id='1',ebay_provider_mode="sandbox")
     db=Database(cfg.database_path); db.migrate(); (tmp_path/'uploads').mkdir()
     return cfg,db
 

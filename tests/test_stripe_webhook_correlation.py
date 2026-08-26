@@ -6,7 +6,7 @@ from config import Config
 
 
 def test_irrelevant_webhook_is_durably_classified_and_duplicate_is_safe(tmp_path):
-    cfg=replace(Config(),database_path=str(tmp_path/'webhooks.sqlite'),stripe_fake_mode=True)
+    cfg=replace(Config(),database_path=str(tmp_path/'webhooks.sqlite'),stripe_provider_mode="fake")
     app=create_app(cfg); client=app.test_client()
     body=json.dumps({'id':'evt_irrelevant','type':'customer.updated','data':{'object':{'email':'never-store@example.test'}}}).encode()
     signature=hmac.new(cfg.stripe_webhook_secret.encode(),body,hashlib.sha256).hexdigest()

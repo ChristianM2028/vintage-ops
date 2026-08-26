@@ -20,7 +20,7 @@ class SandboxSellerSetup:
         self.cfg, self.db, self.client = config, db, client
 
     def run(self):
-        if self.cfg.environment != "sandbox":
+        if self.cfg.ebay_provider_mode != "sandbox":
             raise EbayError("configuration", "Sandbox seller setup is unavailable outside the Sandbox environment")
         if self.cfg.marketplace_id != MARKETPLACE:
             raise EbayError("configuration", "Sandbox seller setup requires EBAY_US")

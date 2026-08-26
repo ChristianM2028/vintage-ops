@@ -27,7 +27,7 @@ class Client:
         raise AssertionError(path)
 
 def cfg(**changes):
-    values=dict(environment='production',expected_ebay_seller_id='seller',production_provider_activation_id='activation',marketplace_id='EBAY_US',location_key='loc',fulfillment_policy_id='f',payment_policy_id='p',return_policy_id='r',currency='USD')
+    values=dict(ebay_provider_mode='production',environment='production',expected_ebay_seller_id='seller',production_provider_activation_id='activation',marketplace_id='EBAY_US',location_key='loc',fulfillment_policy_id='f',payment_policy_id='p',return_policy_id='r',currency='USD')
     values.update(changes); return SimpleNamespace(**values)
 
 def test_production_validation_is_read_only_and_identity_bound(tmp_path):
