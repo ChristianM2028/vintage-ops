@@ -29,6 +29,8 @@ from manual_resolution_service import ManualResolutionService, ManualResolutionE
 from scheduled_jobs import run_scheduled_job
 from money import format_cents
 from commerce_policy import normalized_policy
+from operational import acquire_instance_ownership, readiness, validate_persistent_paths
+from privacy import anonymize_expired
 
 IMAGE_SIGNATURES={"jpg":lambda b:b.startswith(b"\xff\xd8\xff"),"jpeg":lambda b:b.startswith(b"\xff\xd8\xff"),"png":lambda b:b.startswith(b"\x89PNG\r\n\x1a\n"),"gif":lambda b:b.startswith((b"GIF87a",b"GIF89a")),"webp":lambda b:len(b)>=12 and b[:4]==b"RIFF" and b[8:12]==b"WEBP"}
 
@@ -42,6 +44,9 @@ def create_app(config=None, http=None, stripe_adapter=None):
         try: probe.write_text("",encoding="utf-8"); probe.unlink()
         except OSError as exc: raise RuntimeError(f"Configured {label} is not writable") from exc
     require_writable(upload_dir,"upload directory"); require_writable(database_path.parent,"database directory")
+    if cfg.app_environment=="production" or os.getenv("RAILWAY_ENVIRONMENT"):
+        validate_persistent_paths(cfg.database_path,cfg.upload_directory)
+        app.extensions["writer_ownership"]=acquire_instance_ownership(cfg.database_path,cfg.railway_instance_id)
     app.wsgi_app=ProxyFix(app.wsgi_app,x_for=0,x_proto=cfg.proxy_fix_proto,x_host=cfg.proxy_fix_host,x_port=0,x_prefix=0)
     class RedactOAuthQuery(logging.Filter):
         def filter(self, record):
@@ -129,7 +134,7 @@ def create_app(config=None, http=None, stripe_adapter=None):
                 if cfg.canonical_origin and (not source or (urlsplit(source).scheme,urlsplit(source).netloc)!=(urlsplit(cfg.canonical_origin).scheme,urlsplit(cfg.canonical_origin).netloc)):
                     abort(403,"Untrusted request origin")
 
-    public_endpoints={"healthz","shop","shop_item","media","checkout","order_status","order_success","order_cancel","fake_complete_order","fake_cancel_order","stripe_webhook","scheduled_maintenance","scheduled_backup","static","login"}
+    public_endpoints={"healthz","readyz","privacy","terms","shop","shop_item","media","checkout","order_status","order_success","order_cancel","fake_complete_order","fake_cancel_order","stripe_webhook","scheduled_maintenance","scheduled_backup","static","login"}
     @app.before_request
     def seller_guard():
         # Order fulfillment data is never public, even on an incompletely
@@ -161,6 +166,15 @@ def create_app(config=None, http=None, stripe_adapter=None):
     @app.get("/healthz")
     def healthz(): return jsonify({"status":"ok"})
 
+    @app.get("/readyz")
+    def readyz():
+        result=readiness(db,cfg); return jsonify(result),200 if result["status"]=="ready" else 503
+
+    @app.get("/privacy")
+    def privacy(): return render_template("privacy.html")
+    @app.get("/terms")
+    def terms(): return render_template("terms.html")
+
     @app.post("/internal/scheduled-maintenance")
     @limiter.limit(lambda: cfg.internal_job_rate_limit)
     def scheduled_maintenance():
@@ -170,6 +184,7 @@ def create_app(config=None, http=None, stripe_adapter=None):
             return jsonify({"status":"unauthorized"}),401
         ebay=None if cfg.ebay_is_mock else adapters()["ebay"]
         result=run_scheduled_job(db,ebay,limit=cfg.scheduled_job_limit,lease_seconds=cfg.scheduled_job_lease_seconds)
+        result["anonymized_orders"]=anonymize_expired(db,retention_days=cfg.customer_data_retention_days,limit=cfg.anonymization_job_limit)
         return jsonify(result), (200 if result["status"]=="ok" else 409 if result["status"]=="busy" else 502)
 
     @app.post("/internal/scheduled-backup")

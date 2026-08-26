@@ -172,10 +172,18 @@ def restore_backup(cfg,object_key,destination,storage=None):
                 if member.name not in {DATABASE_MEMBER,"manifest.json"} and not member.name.startswith("uploads/"): raise BackupStorageError("Backup archive contains unexpected files")
             manifest=json.load(tar.extractfile("manifest.json"))
             photos=sorted(n[8:] for n in names if n.startswith("uploads/"))
-            if manifest.get("application")!=APPLICATION_NAME or manifest.get("database")!=DATABASE_MEMBER or manifest.get("integrity_check")!="ok" or manifest.get("photo_count")!=len(photos) or sorted(manifest.get("photos",[]))!=photos: raise BackupStorageError("Backup manifest is invalid")
+            if manifest.get("format_version")!=2 or manifest.get("application")!=APPLICATION_NAME or manifest.get("database")!=DATABASE_MEMBER or manifest.get("integrity_check")!="ok" or manifest.get("photo_count")!=len(photos) or sorted(manifest.get("photos",[]))!=photos: raise BackupStorageError("Backup manifest is invalid")
+            records=manifest.get("files")
+            if not isinstance(records,list) or {r.get("path") for r in records if isinstance(r,dict)} != names-{"manifest.json"}: raise BackupStorageError("Backup file inventory is invalid")
             for member in members:
                 target=staged/member.name; target.parent.mkdir(parents=True,exist_ok=True)
                 target.write_bytes(tar.extractfile(member).read())
+            for record in records:
+                target=staged/record["path"]
+                if (not isinstance(record.get("size"),int) or record["size"]<0 or
+                    not re.fullmatch(r"[0-9a-f]{64}",str(record.get("sha256",""))) or
+                    target.stat().st_size!=record["size"] or sha256_file(target)!=record["sha256"]):
+                    raise BackupStorageError("Restored file failed manifest validation")
         with sqlite3.connect((staged/DATABASE_MEMBER).as_uri()+"?mode=ro",uri=True) as con:
             if [r[0] for r in con.execute("PRAGMA integrity_check")] != ["ok"]: raise BackupStorageError("Restored database failed integrity validation")
         if dest.exists(): dest.rmdir()

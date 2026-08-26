@@ -10,8 +10,11 @@ import sqlite3
 import stat
 import tarfile
 import tempfile
+import hashlib
+import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
+from operational import media_generation_barrier
 
 
 APPLICATION_NAME = "vintage-ops"
@@ -107,6 +110,12 @@ def _tar_file(archive: tarfile.TarFile, source: Path, member: str, root: Path | 
     with source.open("rb") as stream:
         archive.addfile(info, stream)
 
+def _file_record(path, member):
+    digest=hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda:stream.read(1024*1024),b""): digest.update(block)
+    return {"path":member,"size":path.stat().st_size,"sha256":digest.hexdigest()}
+
 
 def create_backup(database_path, upload_directory, backup_directory, *, now=None):
     """Create and atomically publish a verified SQLite/uploads archive."""
@@ -115,7 +124,7 @@ def create_backup(database_path, upload_directory, backup_directory, *, now=None
     stamp = timestamp.strftime("%Y%m%dT%H%M%S.%fZ")
     created = timestamp.isoformat(timespec="microseconds").replace("+00:00", "Z")
     final = backups / f"{APPLICATION_NAME}-backup-{stamp}.tar.gz"
-    snapshot = partial = None
+    snapshot = partial = media_stage = None
     snapshot_fd = None
     try:
         backups.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -131,22 +140,32 @@ def create_backup(database_path, upload_directory, backup_directory, *, now=None
         os.chmod(partial, 0o600)
         os.close(snapshot_fd)
         snapshot_fd = None
-        source_uri = database.as_uri() + "?mode=ro"
-        with sqlite3.connect(source_uri, uri=True) as source, sqlite3.connect(snapshot) as target:
-            source.backup(target)
-        with sqlite3.connect(snapshot.as_uri() + "?mode=ro", uri=True) as check:
-            rows = [row[0] for row in check.execute("PRAGMA integrity_check")]
-        if rows != ["ok"]:
-            raise BackupError("Database snapshot failed integrity validation")
-        photos = _regular_uploads(uploads)
+        with media_generation_barrier(uploads,exclusive=True):
+            source_uri = database.as_uri() + "?mode=ro"
+            with sqlite3.connect(source_uri, uri=True) as source, sqlite3.connect(snapshot) as target:
+                source.backup(target)
+            with sqlite3.connect(snapshot.as_uri() + "?mode=ro", uri=True) as check:
+                rows = [row[0] for row in check.execute("PRAGMA integrity_check")]
+            if rows != ["ok"]:
+                raise BackupError("Database snapshot failed integrity validation")
+            # Copy to an immutable generation while application publication is barred.
+            photos = _regular_uploads(uploads)
+            media_stage=Path(tempfile.mkdtemp(prefix=".media-generation-",dir=backups))
+            staged=[]
+            for path,relative,member in photos:
+                target=media_stage/relative; target.parent.mkdir(parents=True,exist_ok=True)
+                shutil.copyfile(path,target); os.chmod(target,0o600); staged.append((target,relative,member))
+        photos=staged
+        files=[_file_record(snapshot,DATABASE_MEMBER)]+[_file_record(path,member) for path,_,member in photos]
         manifest = {
-            "format_version": 1,
+            "format_version": 2,
             "application": APPLICATION_NAME,
             "created_at": created,
             "database": DATABASE_MEMBER,
             "integrity_check": "ok",
             "photo_count": len(photos),
             "photos": [relative for _, relative, _ in photos],
+            "files": files,
         }
         with tarfile.open(partial, "w:gz") as archive:
             _tar_file(archive, snapshot, DATABASE_MEMBER)
@@ -155,7 +174,7 @@ def create_backup(database_path, upload_directory, backup_directory, *, now=None
             info.size, info.mode, info.mtime = len(data), 0o600, 0
             archive.addfile(info, io.BytesIO(data))
             for path, _, member in photos:
-                _tar_file(archive, path, member, uploads)
+                _tar_file(archive, path, member, media_stage)
         os.chmod(partial, 0o600)
         os.replace(partial, final)
         os.chmod(final, 0o600)
@@ -174,6 +193,8 @@ def create_backup(database_path, upload_directory, backup_directory, *, now=None
             snapshot.unlink(missing_ok=True)
         if partial is not None:
             partial.unlink(missing_ok=True)
+        if media_stage is not None:
+            shutil.rmtree(media_stage,ignore_errors=True)
 
 
 def prune_backups(backup_directory, *, keep_days=None, keep_count=None, dry_run=False, now=None):
