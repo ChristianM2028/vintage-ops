@@ -19,8 +19,10 @@ class OrderService:
 
     def create_checkout(self, sku, prior_id=None):
         prior = self.db.get_order(prior_id) if prior_id else None
+        active=getattr(self.stripe,"identity","fake" if self.cfg.stripe_fake_mode else "stripe_test")
+        if prior and prior.get("stripe_provider_identity") not in (None,active):
+            raise StripeIntegrationError("provider_identity","Stored checkout belongs to a different Stripe environment",ambiguous=True)
         if prior and prior["state"] in ("checkout_pending", "authorization_pending") and prior.get("stripe_checkout_session_id"):
-            active=getattr(self.stripe,"identity","fake" if self.cfg.stripe_fake_mode else "stripe_test")
             if prior.get("stripe_provider_identity")==active and active=="fake":
                 return prior, None
             if prior.get("stripe_provider_identity")=="fake" and active=="stripe_test":
