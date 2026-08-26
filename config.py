@@ -18,9 +18,17 @@ def env_bool(name, default=True):
 
 @dataclass(frozen=True)
 class Config:
+    app_environment: str = os.getenv("APP_ENVIRONMENT", "local").strip().lower()
+    stripe_provider_mode: str = os.getenv("STRIPE_PROVIDER_MODE", "").strip().lower()
+    ebay_provider_mode: str = os.getenv("EBAY_PROVIDER_MODE", "").strip().lower()
+    canonical_origin: str = os.getenv("CANONICAL_ORIGIN", "").strip()
+    production_provider_activation_id: str = os.getenv("PRODUCTION_PROVIDER_ACTIVATION_ID", "").strip()
+    expected_stripe_account_id: str = os.getenv("EXPECTED_STRIPE_ACCOUNT_ID", "").strip()
+    expected_ebay_seller_id: str = os.getenv("EXPECTED_EBAY_SELLER_ID", "").strip()
     database_path: str = os.getenv("DATABASE_PATH", "instance/vintage_ops.sqlite3")
     secret_key: str = os.getenv("FLASK_SECRET_KEY", "development-only-change-me")
     encryption_key: str = os.getenv("TOKEN_ENCRYPTION_KEY", "")
+    historical_encryption_keys: tuple = tuple(x.strip() for x in os.getenv("TOKEN_DECRYPT_ONLY_KEYS", "").split(",") if x.strip())
     client_id: str = os.getenv("EBAY_CLIENT_ID", "")
     client_secret: str = os.getenv("EBAY_CLIENT_SECRET", "")
     runame: str = os.getenv("EBAY_RUNAME", "")
@@ -57,6 +65,9 @@ class Config:
     seller_username: str = os.getenv("SELLER_USERNAME", "")
     seller_password_hash: str = os.getenv("SELLER_PASSWORD_HASH", "")
     session_cookie_secure: bool = env_bool("SESSION_COOKIE_SECURE", False)
+    session_idle_seconds: int = int(os.getenv("SESSION_IDLE_SECONDS", "1800"))
+    session_absolute_seconds: int = int(os.getenv("SESSION_ABSOLUTE_SECONDS", "28800"))
+    session_generation: str = os.getenv("SESSION_GENERATION", "local-generation")
     proxy_fix_proto: int = int(os.getenv("PROXY_FIX_PROTO", "0"))
     proxy_fix_host: int = int(os.getenv("PROXY_FIX_HOST", "0"))
     stripe_secret_key: str = os.getenv("STRIPE_SECRET_KEY", "")
@@ -64,6 +75,13 @@ class Config:
     stripe_success_url: str = os.getenv("STRIPE_SUCCESS_URL", "http://127.0.0.1:5000/shop/order/{ORDER_ID}/success")
     stripe_cancel_url: str = os.getenv("STRIPE_CANCEL_URL", "http://127.0.0.1:5000/shop/order/{ORDER_ID}/cancel")
     stripe_fake_mode: bool = env_bool("STRIPE_FAKE_MODE", True)
+    rate_limit_storage_uri: str = os.getenv("RATE_LIMIT_STORAGE_URI", "memory://")
+    login_rate_limit: str = os.getenv("LOGIN_RATE_LIMIT", "5 per minute")
+    checkout_ip_rate_limit: str = os.getenv("CHECKOUT_IP_RATE_LIMIT", "20 per hour")
+    checkout_sku_rate_limit: str = os.getenv("CHECKOUT_SKU_RATE_LIMIT", "5 per hour")
+    order_status_rate_limit: str = os.getenv("ORDER_STATUS_RATE_LIMIT", "60 per minute")
+    webhook_rate_limit: str = os.getenv("WEBHOOK_RATE_LIMIT", "600 per minute")
+    internal_job_rate_limit: str = os.getenv("INTERNAL_JOB_RATE_LIMIT", "120 per minute")
     reservation_seconds: int = int(os.getenv("STOREFRONT_RESERVATION_SECONDS", "1800"))
     scheduled_job_token: str = os.getenv("SCHEDULED_JOB_TOKEN", "")
     scheduled_job_lease_seconds: int = int(os.getenv("SCHEDULED_JOB_LEASE_SECONDS", "240"))
@@ -79,10 +97,20 @@ class Config:
     )
 
     def __post_init__(self):
-        # This milestone is deliberately test-mode only.  Default deny even if
-        # fake mode is enabled so a live credential cannot sit unnoticed.
-        if self.stripe_secret_key.strip().startswith("sk_live_"):
-            raise ValueError("Live Stripe secret keys are not supported")
+        if self.app_environment not in {"local","sandbox","production"}:
+            raise ValueError("APP_ENVIRONMENT must be local, sandbox, or production")
+        stripe_mode=self.stripe_provider_mode or ("fake" if self.stripe_fake_mode else "test")
+        ebay_mode=self.ebay_provider_mode or ("mock" if self.marketplace_mock_mode else self.environment)
+        if stripe_mode not in {"fake","test","live"}: raise ValueError("Unknown Stripe provider mode")
+        if ebay_mode not in {"mock","sandbox","production"}: raise ValueError("Unknown eBay provider mode")
+        allowed={"local":({"fake","test"},{"mock","sandbox"}),"sandbox":({"fake","test"},{"mock","sandbox"}),"production":({"live"},{"production"})}
+        if stripe_mode not in allowed[self.app_environment][0] or ebay_mode not in allowed[self.app_environment][1]:
+            raise ValueError("Provider modes do not match APP_ENVIRONMENT")
+        key=self.stripe_secret_key.strip()
+        if stripe_mode=="live" and not key.startswith("sk_live_"): raise ValueError("Stripe live mode requires an sk_live_ key")
+        if stripe_mode=="test" and (self.stripe_provider_mode or self.app_environment!="local") and not key.startswith("sk_test_"): raise ValueError("Stripe test mode requires an sk_test_ key")
+        if self.stripe_provider_mode and stripe_mode=="fake" and key.startswith(("sk_live_","sk_test_")): raise ValueError("Stripe fake mode cannot contain a provider key")
+        if stripe_mode!="live" and key.startswith("sk_live_"): raise ValueError("Live Stripe keys require validated production mode")
         if not self.stripe_shipping_countries or any(
                 not re.fullmatch(r"[A-Z]{2}", value) for value in self.stripe_shipping_countries):
             raise ValueError("Stripe shipping countries must be two-letter country codes")
@@ -122,3 +150,36 @@ class Config:
                 raise ValueError("BACKUP_ENCRYPTION_KEY must encode exactly 32 bytes")
         if hosted and len(self.backup_scheduled_job_token) < 32:
             raise ValueError("BACKUP_SCHEDULED_JOB_TOKEN must be a high-entropy value in hosted environments")
+        if not 60 <= self.session_idle_seconds <= self.session_absolute_seconds <= 86400:
+            raise ValueError("Session lifetime bounds are invalid")
+        strict=self.app_environment in {"sandbox","production"} or hosted
+        placeholders={"","development-only-change-me","development-webhook-secret","change-me","changeme","secret","password","local-generation"}
+        def strong(name,value,minimum=32):
+            if not value or len(value.strip())<minimum or value.strip().lower() in placeholders or "placeholder" in value.lower():
+                raise ValueError(f"{name} must be a non-placeholder high-entropy value")
+        if strict:
+            for name,value in (("FLASK_SECRET_KEY",self.secret_key),("STRIPE_WEBHOOK_SECRET",self.stripe_webhook_secret),
+                ("SELLER_USERNAME",self.seller_username),("SELLER_PASSWORD_HASH",self.seller_password_hash),
+                ("SCHEDULED_JOB_TOKEN",self.scheduled_job_token),("BACKUP_SCHEDULED_JOB_TOKEN",self.backup_scheduled_job_token),
+                ("TOKEN_ENCRYPTION_KEY",self.encryption_key),("BACKUP_ENCRYPTION_KEY",self.backup_encryption_key),("SESSION_GENERATION",self.session_generation)):
+                strong(name,value,8 if name=="SELLER_USERNAME" else 32)
+            if not self.session_cookie_secure: raise ValueError("SESSION_COOKIE_SECURE=true is required")
+            try:
+                keys=(self.encryption_key,)+self.historical_encryption_keys
+                decoded=[base64.urlsafe_b64decode(value.encode("ascii")) for value in keys]
+            except Exception as exc: raise ValueError("Token encryption keys must be URL-safe base64") from exc
+            if any(len(value)!=32 for value in decoded) or len(set(keys))!=len(keys):
+                raise ValueError("Token encryption keys must be distinct Fernet keys")
+        origin=urlsplit(self.canonical_origin)
+        if self.canonical_origin and (origin.scheme!="https" or not origin.netloc or origin.username or origin.password or origin.path not in ("", "/") or origin.query or origin.fragment):
+            raise ValueError("CANONICAL_ORIGIN must be one credential-free HTTPS origin")
+        if strict and not self.canonical_origin: raise ValueError("CANONICAL_ORIGIN is required")
+        for name,value in (("STRIPE_SUCCESS_URL",self.stripe_success_url),("STRIPE_CANCEL_URL",self.stripe_cancel_url)):
+            if value.count("{ORDER_ID}") != 1: raise ValueError(f"{name} must contain the exact {{ORDER_ID}} placeholder once")
+            if strict and urlsplit(value).scheme!="https": raise ValueError(f"{name} must use HTTPS")
+        if self.app_environment=="production":
+            strong("PRODUCTION_PROVIDER_ACTIVATION_ID",self.production_provider_activation_id)
+            strong("EXPECTED_STRIPE_ACCOUNT_ID",self.expected_stripe_account_id,8); strong("EXPECTED_EBAY_SELLER_ID",self.expected_ebay_seller_id,6)
+            if not self.rate_limit_storage_uri or self.rate_limit_storage_uri=="memory://": raise ValueError("Production requires a shared rate-limit store")
+            for name,path in (("DATABASE_PATH",self.database_path),("UPLOAD_DIRECTORY",self.upload_directory),("BACKUP_DIRECTORY",self.backup_directory)):
+                if not Path(path).is_absolute() or not str(Path(path)).startswith("/data/"): raise ValueError(f"{name} must be a production persistent path")

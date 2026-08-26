@@ -1,7 +1,7 @@
 -- Forward-only reliability metadata. Existing Stripe rows cannot be identified
 -- from their identifier prefixes, so they deliberately remain legacy_unknown.
 ALTER TABLE storefront_orders ADD COLUMN stripe_provider_identity TEXT NOT NULL DEFAULT 'legacy_unknown'
- CHECK(stripe_provider_identity IN ('fake','stripe_test','legacy_unknown'));
+ CHECK(stripe_provider_identity IN ('fake','stripe_test','stripe_live','legacy_unknown'));
 
 ALTER TABLE storefront_operations ADD COLUMN claim_token TEXT;
 ALTER TABLE storefront_operations ADD COLUMN lease_expires_at TEXT;

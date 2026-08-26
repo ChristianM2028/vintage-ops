@@ -2,6 +2,45 @@
 
 A deliberately small local Flask/SQLite seller application for preparing clothing inventory and publishing it to eBay. It uses one Python runtime, server-rendered pages, encrypted seller tokens, and no browser-side credentials. A narrow adapter boundary keeps the real eBay integration isolated.
 
+## Production security and secret operations
+
+`APP_ENVIRONMENT` is the authority for provider selection. Sandbox and live
+services must be separate Railway environments and must never reuse a secret,
+database, bucket prefix, Stripe account, eBay seller, or activation ID. The
+service owner creates each secret in the platform secret store, grants it only
+to the web service (cron receives only its bearer token), records its owner and
+rotation date in the private operations register, and removes the predecessor
+after validation. Never print secrets or copy them into tickets or deployment
+files.
+
+Before production activation, a second operator performs read-only identity
+checks using the Stripe account API and eBay identity API and records that the
+returned account and seller exactly equal `EXPECTED_STRIPE_ACCOUNT_ID` and
+`EXPECTED_EBAY_SELLER_ID`. They then set a unique, environment-specific
+`PRODUCTION_PROVIDER_ACTIVATION_ID`. Rollback means removing that activation ID,
+rolling back the release, and revoking—not merely deleting locally—provider
+keys, OAuth grants, webhook secrets, job tokens, and object-store credentials.
+
+Rotate `FLASK_SECRET_KEY`, `SESSION_GENERATION`, seller credentials, webhook and
+job tokens, provider credentials, S3 credentials, and backup keys according to
+their owners' schedules or immediately after suspected exposure. **Emergency
+session revocation:** replace `SESSION_GENERATION` with a new random 32-byte
+value and redeploy; every existing cookie fails the server-side generation
+check. Token decrypt rotation uses one `TOKEN_ENCRYPTION_KEY` for new writes and
+comma-separated `TOKEN_DECRYPT_ONLY_KEYS` only during a planned migration;
+remove historical keys after all records have been rewritten. Backup-key
+rotation requires retaining the old key offline until every retained generation
+encrypted by it expires or is re-encrypted and restore-tested.
+
+Production uses `/data` only for the database, uploads, and backups, and a
+shared Redis-compatible `RATE_LIMIT_STORAGE_URI` before increasing replicas.
+The image runs as the unprivileged `vintage` user and uses its dedicated temp
+directory. Dependency changes are made in a reviewed branch: update one pin at
+a time, run the complete test suite plus `pip-audit -r requirements.txt` and
+`pip-licenses --from=mixed`, review changelogs/licenses, stage in Sandbox, then
+promote the identical lock set. High/critical findings block promotion; record
+an owner, expiry, and compensating control for any time-bounded exception.
+
 ## Railway Sandbox deployment (not for live commerce)
 
 > **Sandbox only:** this checked-in Railway configuration must never be used with

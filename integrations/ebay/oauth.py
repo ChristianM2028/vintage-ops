@@ -1,7 +1,7 @@
 import base64, hashlib, secrets
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
-from cryptography.fernet import Fernet, InvalidToken
+from cryptography.fernet import Fernet, InvalidToken, MultiFernet
 from .errors import EbayError, parse_error
 from db import now
 
@@ -13,7 +13,8 @@ SCOPES=("https://api.ebay.com/oauth/api_scope "
 class OAuthManager:
     def __init__(self, config, db, session):
         self.cfg=config; self.db=db; self.http=session
-        self.fernet=Fernet(config.encryption_key.encode()) if config.encryption_key else None
+        keys=([config.encryption_key]+list(config.historical_encryption_keys)) if config.encryption_key else []
+        self.fernet=MultiFernet([Fernet(key.encode()) for key in keys]) if keys else None
     @property
     def identity_base(self): return "https://auth.sandbox.ebay.com" if self.cfg.environment=="sandbox" else "https://auth.ebay.com"
     @property

@@ -1,4 +1,4 @@
-import json, logging, os, re, secrets
+import json, logging, os, re, secrets, time
 import click
 from dataclasses import replace
 from decimal import Decimal, InvalidOperation
@@ -8,6 +8,8 @@ from functools import wraps
 from urllib.parse import urlsplit
 from werkzeug.security import check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 import requests
 from config import Config
 from backups import BackupError, create_backup, prune_backups
@@ -51,6 +53,9 @@ def create_app(config=None, http=None, stripe_adapter=None):
         try: check_password_hash(cfg.seller_password_hash,"startup-validation-only")
         except (ValueError,TypeError): password_hash_valid=False
     app.config.update(SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE="Lax",SESSION_COOKIE_SECURE=cfg.session_cookie_secure)
+    app.config["MAX_CONTENT_LENGTH"]=cfg.max_photo_count*cfg.max_upload_size+1024*1024
+    limiter=Limiter(key_func=get_remote_address,app=app,storage_uri=cfg.rate_limit_storage_uri,
+                    default_limits=[],headers_enabled=True)
     def real_components(overrides=None):
         current=replace(cfg,**(overrides or {})); oauth=OAuthManager(current,db,http_session)
         return oauth,EbayService(current,db,EbayClient(current,oauth,http_session))
@@ -63,6 +68,10 @@ def create_app(config=None, http=None, stripe_adapter=None):
     def resolve_ebay(item, establish=False):
         """Resolve from persisted item state, classifying an unlisted item once."""
         mode=item.get("ebay_integration_mode")
+        provider_mode=cfg.ebay_provider_mode or ("mock" if cfg.marketplace_mock_mode else cfg.environment)
+        active={"mock":"local_mock","sandbox":"ebay_sandbox","production":"ebay_production"}[provider_mode]
+        if mode and mode != active:
+            raise EbayError("provider_identity","Stored listing belongs to a different eBay environment")
         if not mode and establish:
             associated=any(item.get(k) for k in ("ebay_sku","ebay_offer_id","ebay_listing_id","ebay_publication_state"))
             if associated: raise EbayError("classification_required","This legacy published item needs an explicit eBay integration mode")
@@ -93,8 +102,24 @@ def create_app(config=None, http=None, stripe_adapter=None):
     app.jinja_env.globals["csrf_token"]=csrf_token
     @app.before_request
     def csrf_protect():
+        # Railway's public proxy is used only for scheme/host by explicit hop
+        # count; remote_addr remains the limiter identity, so arbitrary XFF is
+        # never accepted as a client address.
+        if cfg.app_environment=="production":
+            canonical=urlsplit(cfg.canonical_origin)
+            if request.host.lower()!=canonical.netloc.lower(): abort(400,"Unexpected Host")
+            if not request.is_secure:
+                if request.method in {"GET","HEAD"}: return redirect(cfg.canonical_origin+request.full_path.rstrip("?"),308)
+                abort(400,"HTTPS is required")
         expected=session.get("csrf_token")
-        if request.method=="POST" and request.endpoint not in {"stripe_webhook","scheduled_maintenance","scheduled_backup"} and (not expected or not secrets.compare_digest(expected, request.form.get("csrf_token", ""))): abort(400,"Invalid CSRF token")
+        exempt=request.endpoint in {"stripe_webhook","scheduled_maintenance","scheduled_backup"}
+        if request.method in {"POST","PUT","PATCH","DELETE"} and not exempt:
+            if not expected or not secrets.compare_digest(expected, request.form.get("csrf_token", "")): abort(400,"Invalid CSRF token")
+            if request.mimetype not in {"application/x-www-form-urlencoded","multipart/form-data"}: abort(415,"Form content type required")
+            if session.get("seller_authenticated"):
+                source=request.headers.get("Origin") or request.headers.get("Referer")
+                if cfg.canonical_origin and (not source or (urlsplit(source).scheme,urlsplit(source).netloc)!=(urlsplit(cfg.canonical_origin).scheme,urlsplit(cfg.canonical_origin).netloc)):
+                    abort(403,"Untrusted request origin")
 
     public_endpoints={"healthz","shop","shop_item","media","checkout","order_status","order_success","order_cancel","fake_complete_order","fake_cancel_order","stripe_webhook","scheduled_maintenance","scheduled_backup","static","login"}
     @app.before_request
@@ -102,15 +127,34 @@ def create_app(config=None, http=None, stripe_adapter=None):
         # Order fulfillment data is never public, even on an incompletely
         # configured development install where the legacy seller UI is open.
         always_protected={"orders","order_detail","packing_slip","seller_cancel_order","seller_retry_order","seller_refund_order","seller_recheck_refund","manual_recheck","manual_resume","manual_cancel","manual_reconcile_canceled","manual_reconcile_captured","mark_packing","mark_shipped","correct_tracking","mark_delivered","add_order_note","acknowledge_attention"}
-        if request.endpoint not in always_protected and (not cfg.seller_username or not cfg.seller_password_hash): return
         if request.endpoint in public_endpoints: return
+        if (not cfg.seller_username or not cfg.seller_password_hash) and cfg.app_environment!="local": abort(503)
+        if (not cfg.seller_username or not cfg.seller_password_hash) and cfg.app_environment=="local": return
+        if session.get("seller_authenticated"):
+            now=int(time.time()); login=session.get("login_at",0); activity=session.get("last_activity",0)
+            if session.get("generation")!=cfg.session_generation or now-login>cfg.session_absolute_seconds or now-activity>cfg.session_idle_seconds:
+                session.clear(); return redirect(url_for("login"))
+            session["last_activity"]=now
         if not session.get("seller_authenticated"):
             return redirect(url_for("login",next=request.full_path if request.method=="GET" else ""))
+
+    @app.after_request
+    def security_headers(response):
+        response.headers["X-Content-Type-Options"]="nosniff"
+        response.headers["Content-Security-Policy"]="default-src 'self'; img-src 'self' https: data:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+        response.headers["Referrer-Policy"]="no-referrer"
+        response.headers["Permissions-Policy"]="camera=(), microphone=(), geolocation=()"
+        if cfg.app_environment=="production" and cfg.canonical_origin.startswith("https://"):
+            response.headers["Strict-Transport-Security"]="max-age=31536000; includeSubDomains"
+        if request.endpoint in {"login","order_status","order_success","order_cancel","authorize","callback","ebay_settings"} or session.get("seller_authenticated"):
+            response.headers["Cache-Control"]="private, no-store"
+        return response
 
     @app.get("/healthz")
     def healthz(): return jsonify({"status":"ok"})
 
     @app.post("/internal/scheduled-maintenance")
+    @limiter.limit(lambda: cfg.internal_job_rate_limit)
     def scheduled_maintenance():
         supplied=request.headers.get("Authorization","")
         expected="Bearer "+cfg.scheduled_job_token if cfg.scheduled_job_token else ""
@@ -121,6 +165,7 @@ def create_app(config=None, http=None, stripe_adapter=None):
         return jsonify(result), (200 if result["status"]=="ok" else 409 if result["status"]=="busy" else 502)
 
     @app.post("/internal/scheduled-backup")
+    @limiter.limit(lambda: cfg.internal_job_rate_limit)
     def scheduled_backup():
         supplied=request.headers.get("Authorization","")
         expected="Bearer "+cfg.backup_scheduled_job_token if cfg.backup_scheduled_job_token else ""
@@ -144,6 +189,7 @@ def create_app(config=None, http=None, stripe_adapter=None):
             return jsonify(result),502 if category!="configuration" else 503
 
     @app.route("/login",methods=["GET","POST"])
+    @limiter.limit(lambda: cfg.login_rate_limit,methods=["POST"])
     def login():
         if request.method=="POST":
             valid_user=secrets.compare_digest(request.form.get("username",""),cfg.seller_username)
@@ -153,6 +199,7 @@ def create_app(config=None, http=None, stripe_adapter=None):
             if valid_user and valid_password:
                 destination=request.form.get("next","")
                 session.clear(); session["seller_authenticated"]=True; session["csrf_token"]=secrets.token_urlsafe(32)
+                session["login_at"]=session["last_activity"]=int(time.time()); session["generation"]=cfg.session_generation
                 if not destination or urlsplit(destination).netloc or not destination.startswith("/"): destination=url_for("home")
                 return redirect(destination)
             flash("Invalid seller credentials.","error")
@@ -282,6 +329,8 @@ def create_app(config=None, http=None, stripe_adapter=None):
         item=db.get_storefront_item_by_sku(sku) or abort(404)
         return render_template("shop_item.html",item=item)
     @app.post("/shop/item/<sku>/checkout")
+    @limiter.limit(lambda: cfg.checkout_ip_rate_limit)
+    @limiter.limit(lambda: cfg.checkout_sku_rate_limit,key_func=lambda: f"sku:{request.view_args['sku']}")
     def checkout(sku):
         prior_id=(session.get("checkout_orders") or {}).get(sku)
         try: order,provider_url=order_service.create_checkout(sku,prior_id)
@@ -292,6 +341,7 @@ def create_app(config=None, http=None, stripe_adapter=None):
         return redirect(destination,code=303)
 
     @app.post("/stripe/webhook")
+    @limiter.limit(lambda: cfg.webhook_rate_limit)
     def stripe_webhook():
         payload=request.get_data(cache=False)
         try: event=stripe_gateway.verify_webhook(payload,request.headers.get("Stripe-Signature"))
@@ -347,6 +397,7 @@ def create_app(config=None, http=None, stripe_adapter=None):
         response.headers.update({"Cache-Control":"private, no-store","X-Robots-Tag":"noindex, nofollow","Referrer-Policy":"no-referrer"})
         return response
     @app.get("/shop/order/<public_id>")
+    @limiter.limit(lambda: cfg.order_status_rate_limit)
     def order_status(public_id): return render_order(public_id)
     @app.get("/shop/order/<public_id>/success")
     def order_success(public_id): return render_order(public_id,redirect_kind="success")
