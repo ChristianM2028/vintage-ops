@@ -99,6 +99,9 @@ class Config:
     business_address: str = os.getenv("BUSINESS_ADDRESS", "")
     checkout_enabled: bool = env_bool("CHECKOUT_ENABLED", False)
     ebay_listing_enabled: bool = env_bool("EBAY_LISTING_ENABLED", False)
+    customer_data_retention_days: int = int(os.getenv("CUSTOMER_DATA_RETENTION_DAYS", "730"))
+    anonymization_job_limit: int = int(os.getenv("ANONYMIZATION_JOB_LIMIT", "100"))
+    railway_instance_id: str = os.getenv("RAILWAY_REPLICA_ID", os.getenv("RAILWAY_SERVICE_ID", "local"))
     pricing_legal_reviewed: bool = env_bool("PRICING_LEGAL_REVIEWED", False)
     commerce_policy_reviewed: bool = env_bool("COMMERCE_POLICY_REVIEWED", False)
     commerce_policy_id: str = os.getenv("COMMERCE_POLICY_ID", "").strip()
@@ -228,6 +231,8 @@ class Config:
             if not self.rate_limit_storage_uri or self.rate_limit_storage_uri=="memory://": raise ValueError("Production requires a shared rate-limit store")
             for name,path in (("DATABASE_PATH",self.database_path),("UPLOAD_DIRECTORY",self.upload_directory),("BACKUP_DIRECTORY",self.backup_directory)):
                 if not Path(path).is_absolute() or not str(Path(path)).startswith("/data/"): raise ValueError(f"{name} must be a production persistent path")
+        if not 30 <= self.customer_data_retention_days <= 3650 or not 1 <= self.anonymization_job_limit <= 500:
+            raise ValueError("Privacy retention/job bounds are invalid")
 
     @property
     def stripe_identity(self):

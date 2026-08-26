@@ -28,7 +28,10 @@ class Database:
     def connect(self):
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         con = sqlite3.connect(self.path, timeout=30); con.row_factory = sqlite3.Row
-        con.execute("PRAGMA foreign_keys=ON"); con.execute("PRAGMA busy_timeout=30000"); return con
+        con.execute("PRAGMA foreign_keys=ON"); con.execute("PRAGMA busy_timeout=30000")
+        # DELETE avoids WAL sidecars during volume snapshots; FULL trades a small
+        # amount of throughput for durable commits on the single-writer volume.
+        con.execute("PRAGMA journal_mode=DELETE"); con.execute("PRAGMA synchronous=FULL"); return con
     def migrate(self):
         with self.connect() as con:
             con.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY, applied_at TEXT NOT NULL)")
@@ -668,7 +671,8 @@ class Database:
         """Deduplicate an order line and atomically reduce immediately-visible stock."""
         with self.transaction(immediate=True) as c:
             if c.execute("SELECT 1 FROM ebay_order_lines WHERE order_id=? AND line_item_id=?",(order_id,line_id)).fetchone(): return False
-            c.execute("INSERT INTO ebay_order_lines(order_id,line_item_id,sku,listing_id,quantity,payment_state,fulfillment_state,raw_payload,processed_at) VALUES(?,?,?,?,?,?,?,?,?)",(order_id,line_id,sku,listing_id,quantity,payment,fulfillment,json.dumps(raw),now()))
+            projection={k:raw.get(k) for k in ("legacyItemId","lineItemId","sku","quantity","lineItemCost","deliveryCost","total") if raw.get(k) is not None} if isinstance(raw,dict) else {}
+            c.execute("INSERT INTO ebay_order_lines(order_id,line_item_id,sku,listing_id,quantity,payment_state,fulfillment_state,raw_payload,processed_at) VALUES(?,?,?,?,?,?,?,?,?)",(order_id,line_id,sku,listing_id,quantity,payment,fulfillment,json.dumps(projection,sort_keys=True,separators=(",",":")),now()))
             if payment not in ("PAID","FULLY_REFUNDED"):
                 return True
             row=c.execute("SELECT * FROM items WHERE ebay_sku=? OR ebay_listing_id=?",(sku,listing_id)).fetchone()
