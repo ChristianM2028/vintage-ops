@@ -87,6 +87,17 @@ class Database:
                 updated_at=excluded.updated_at""", (seller_id,fulfillment_policy_id,payment_policy_id,
                     return_policy_id,merchant_location_key,marketplace,stamp))
         return self.get_seller_setup()
+    def save_production_activation(self, activation):
+        fields=("activation_id","seller_id","marketplace","merchant_location_key","fulfillment_policy_id","payment_policy_id","return_policy_id","currency","token_identity")
+        if any(not str(activation.get(k) or "").strip() for k in fields): raise SellerSetupError("Production activation contract is incomplete")
+        with self.transaction(immediate=True) as c:
+            c.execute("DELETE FROM ebay_production_activations")
+            c.execute("INSERT INTO ebay_production_activations VALUES (?,?,?,?,?,?,?,?,?,?)",tuple(activation[k] for k in fields)+(now(),))
+        return self.get_production_activation()
+    def get_production_activation(self):
+        with self.connect() as c:
+            row=c.execute("SELECT * FROM ebay_production_activations LIMIT 1").fetchone(); return dict(row) if row else None
+
     @contextmanager
     def transaction(self, immediate=False):
         con=self.connect()
@@ -259,7 +270,8 @@ class Database:
         "paid":{"sold","manual_resolution"}, "authorization_cancel_pending":{"cancelled","unavailable","manual_resolution"},
         "sold":{"manual_resolution"}, "cancelled":set(), "expired":set(), "unavailable":{"manual_resolution"}, "manual_resolution":set()
     }
-    def create_storefront_order(self, sku, duration_seconds=1800, provider_identity="legacy_unknown"):
+    def create_storefront_order(self, sku, duration_seconds=1800, provider_identity="legacy_unknown", pricing=None):
+        pricing=pricing or {}
         stamp=now(); expiry=(datetime.now(timezone.utc)+timedelta(seconds=duration_seconds)).isoformat()
         with self.transaction(immediate=True) as c:
             item=c.execute("SELECT * FROM items WHERE sku=?",(sku,)).fetchone()
@@ -268,7 +280,8 @@ class Database:
             if reservation: raise ValueError("Item reserved")
             c.execute("UPDATE item_reservations SET state='expired',close_reason='expired',updated_at=? WHERE item_id=? AND state='open' AND expires_at<=?",(stamp,item["id"],stamp))
             public_id=secrets.token_urlsafe(24)
-            cur=c.execute("INSERT INTO storefront_orders(public_id,item_id,price_snapshot,currency_snapshot,state,stripe_provider_identity,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",(public_id,item["id"],item["price"],item["currency"],"checkout_pending",provider_identity,stamp,stamp))
+            subtotal=int(round(float(item["price"])*100)); shipping=int(pricing.get("shipping_amount",0)); tax=int(pricing.get("tax_amount",0)); total=subtotal+shipping+tax
+            cur=c.execute("INSERT INTO storefront_orders(public_id,item_id,price_snapshot,currency_snapshot,item_subtotal_amount,shipping_amount,tax_amount,final_total_amount,state,stripe_provider_identity,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(public_id,item["id"],item["price"],item["currency"],subtotal,shipping,tax,total,"checkout_pending",provider_identity,stamp,stamp))
             rid=c.execute("INSERT INTO item_reservations(item_id,order_id,state,expires_at,created_at,updated_at) VALUES(?,?,'open',?,?,?)",(item["id"],cur.lastrowid,expiry,stamp,stamp)).lastrowid
             c.execute("UPDATE storefront_orders SET reservation_id=? WHERE id=?",(rid,cur.lastrowid))
             self._event(c,cur.lastrowid,None,"checkout_pending","shopper","order_created")
@@ -281,12 +294,12 @@ class Database:
         """Allowlisted shopper projection; never expose provider, customer or internal data."""
         with self.connect() as con:
             row=con.execute("""SELECT o.public_id,o.state,o.payment_state,o.fulfillment_state,
-                o.refund_state,o.created_at,o.tracking_carrier,o.tracking_number,o.tracking_url,
+                o.refund_state,o.created_at,o.item_subtotal_amount,o.shipping_amount,o.tax_amount,o.final_total_amount,o.currency_snapshot,o.tracking_carrier,o.tracking_number,o.tracking_url,
                 i.sku,i.title,i.condition,i.brand,i.size,i.color
                 FROM storefront_orders o JOIN items i ON i.id=o.item_id WHERE o.public_id=?""",(public_id,)).fetchone()
             if not row: return None
             result={key:row[key] for key in ("public_id","state","payment_state","fulfillment_state",
-                "refund_state","created_at","sku","title","condition","brand","size","color")}
+                "refund_state","created_at","item_subtotal_amount","shipping_amount","tax_amount","final_total_amount","currency_snapshot","sku","title","condition","brand","size","color")}
             result["payment_outcome"]=("paid" if row["payment_state"]=="captured" else
                 "not_completed" if row["payment_state"] in ("cancelled","unpaid") else "processing")
             if row["fulfillment_state"] in ("shipped","delivered"):

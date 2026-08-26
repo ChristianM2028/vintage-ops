@@ -12,8 +12,10 @@ class StripeAdapter:
                 api_key=self.cfg.stripe_secret_key,
                 mode="payment", payment_intent_data={"capture_method":"manual","metadata":{"order":order["public_id"]}},
                 payment_method_types=["card"],
+                automatic_tax={"enabled":False}, tax_id_collection={"enabled":False},
                 shipping_address_collection={"allowed_countries":list(self.cfg.stripe_shipping_countries)},
-                line_items=[{"quantity":1,"price_data":{"currency":order["currency_snapshot"].lower(),"unit_amount":int(round(float(order["price_snapshot"])*100)),"product_data":{"name":item["title"][:120]}}}],
+                shipping_options=[{"shipping_rate_data":{"type":"fixed_amount","fixed_amount":{"amount":order["shipping_amount"],"currency":order["currency_snapshot"].lower()},"display_name":"Launch shipping (included)"}}],
+                line_items=[{"quantity":1,"price_data":{"currency":order["currency_snapshot"].lower(),"unit_amount":order["item_subtotal_amount"]+order["tax_amount"],"product_data":{"name":item["title"][:120],"description":"Tax-inclusive launch price; shipping included"}}}],
                 success_url=success_url, cancel_url=cancel_url, client_reference_id=order["public_id"],
                 idempotency_key=f"checkout:{order['public_id']}")
             return {"id":result.id,"url":result.url,"payment_intent":getattr(result,"payment_intent",None)}

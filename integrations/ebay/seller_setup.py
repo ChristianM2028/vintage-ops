@@ -65,18 +65,11 @@ class SandboxSellerSetup:
             raise EbayError("manual_resolution", f"{message} app-managed {kind} policy was found after creation")
         return found[0][id_field]
 
-    @staticmethod
-    def _policy_payload(kind, name):
+    def _policy_payload(self, kind, name):
         common = {"name": name, "marketplaceId": MARKETPLACE,
                   "categoryTypes": [{"name": "ALL_EXCLUDING_MOTORS_VEHICLES", "default": True}]}
         if kind == "fulfillment":
-            common.update({
-                "handlingTime": {"value": 1, "unit": "DAY"},
-                "shippingOptions": [{"optionType": "DOMESTIC", "costType": "FLAT_RATE",
-                    "shippingServices": [{"sortOrder": 1, "shippingCarrierCode": "USPS",
-                        "shippingServiceCode": "USPSPriority", "shippingCost": {"value": "0.00", "currency": "USD"},
-                        "freeShipping": True}]}],
-            })
+            raise EbayError("configuration", "Sandbox fulfillment policy must be supplied explicitly; automatic policy creation is disabled")
         elif kind == "return":
             common.update({"returnsAccepted": True, "returnPeriod": {"value": 30, "unit": "DAY"},
                            "returnShippingCostPayer": "BUYER"})
@@ -87,21 +80,9 @@ class SandboxSellerSetup:
         try:
             location = self.client.request("GET", path)
         except EbayError as error:
-            if error.status != 404:
-                raise
-            payload = {
-                "location": {"address": {"addressLine1": "2025 Hamilton Avenue", "city": "San Jose",
-                    "stateOrProvince": "CA", "postalCode": "95125", "country": "US"}},
-                "locationTypes": ["WAREHOUSE"], "name": "Vintage Ops Sandbox Main",
-            }
-            try:
-                self.client.request("POST", path, json=payload, expected=(204,))
-            except EbayError as create_error:
-                # The key makes create naturally idempotent; confirm an uncertain
-                # or racing create rather than issuing a second create request.
-                if create_error.kind not in ("remote", "conflict"):
-                    raise
-            location = self.client.request("GET", path)
+            if error.status == 404:
+                raise EbayError("configuration", "Configure the Sandbox merchant location explicitly before setup") from error
+            raise
         if location.get("merchantLocationStatus") == "DISABLED":
             self.client.request("POST", f"{path}/enable", expected=(204,))
         return LOCATION_KEY

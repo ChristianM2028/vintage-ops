@@ -680,13 +680,12 @@ def create_app(config=None, http=None, stripe_adapter=None):
     @app.cli.command("ebay-reconcile-orders")
     @click.option("--limit",type=int,default=100,show_default=True)
     def ebay_reconcile_cli(limit):
-        """Reconcile a bounded batch of eBay Sandbox orders."""
+        """Reconcile a bounded batch after the environment activation contract passes."""
         limit=bounded(limit)
-        if cfg.environment != "sandbox": raise click.ClickException("eBay reconciliation is restricted to Sandbox")
-        if cfg.marketplace_mock_mode: raise click.ClickException("eBay reconciliation requires the Sandbox provider")
+        if cfg.marketplace_mock_mode: raise click.ClickException("eBay reconciliation requires a real target provider")
         try: summary=run_scheduled_job(db,adapters()["ebay"],cleanup=False,reconcile=True,limit=limit,lease_seconds=cfg.scheduled_job_lease_seconds,job_name="ebay-reconcile-orders")
         except Exception as exc:
-            app.logger.error("Sandbox eBay reconciliation failed: %s",type(exc).__name__)
+            app.logger.error("eBay reconciliation failed: %s",type(exc).__name__)
             raise click.ClickException("eBay reconciliation failed") from exc
         if summary["status"]!="ok": raise click.ClickException("eBay reconciliation failed")
         result={"processed":summary["orders_processed"],"duplicate":summary["duplicates"],"unknown":summary["unknown_items"]}

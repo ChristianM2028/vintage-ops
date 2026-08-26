@@ -91,6 +91,12 @@ class Config:
     ebay_order_max_orders: int = int(os.getenv("EBAY_ORDER_MAX_ORDERS", "500"))
     business_name: str = os.getenv("BUSINESS_NAME", "Vintage Ops")
     business_address: str = os.getenv("BUSINESS_ADDRESS", "")
+    checkout_enabled: bool = env_bool("CHECKOUT_ENABLED", True)
+    ebay_listing_enabled: bool = env_bool("EBAY_LISTING_ENABLED", True)
+    pricing_legal_reviewed: bool = env_bool("PRICING_LEGAL_REVIEWED", False)
+    stripe_shipping_amount: int = int(os.getenv("STRIPE_SHIPPING_AMOUNT_CENTS", "0"))
+    stripe_tax_amount: int = int(os.getenv("STRIPE_TAX_AMOUNT_CENTS", "0"))
+    stripe_shipping_states: tuple = tuple(x.strip().upper() for x in os.getenv("STRIPE_SHIPPING_STATES", "CA").split(",") if x.strip())
     stripe_shipping_countries: tuple = tuple(
         country.strip().upper() for country in os.getenv("STRIPE_SHIPPING_COUNTRIES", "US").split(",")
         if country.strip()
@@ -111,6 +117,8 @@ class Config:
         if stripe_mode=="test" and (self.stripe_provider_mode or self.app_environment!="local") and not key.startswith("sk_test_"): raise ValueError("Stripe test mode requires an sk_test_ key")
         if self.stripe_provider_mode and stripe_mode=="fake" and key.startswith(("sk_live_","sk_test_")): raise ValueError("Stripe fake mode cannot contain a provider key")
         if stripe_mode!="live" and key.startswith("sk_live_"): raise ValueError("Live Stripe keys require validated production mode")
+        if self.stripe_shipping_amount < 0 or self.stripe_tax_amount < 0: raise ValueError("Pricing amounts cannot be negative")
+        if not self.stripe_shipping_states: raise ValueError("At least one supported shipping state is required")
         if not self.stripe_shipping_countries or any(
                 not re.fullmatch(r"[A-Z]{2}", value) for value in self.stripe_shipping_countries):
             raise ValueError("Stripe shipping countries must be two-letter country codes")
@@ -178,6 +186,7 @@ class Config:
             if value.count("{ORDER_ID}") != 1: raise ValueError(f"{name} must contain the exact {{ORDER_ID}} placeholder once")
             if strict and urlsplit(value).scheme!="https": raise ValueError(f"{name} must use HTTPS")
         if self.app_environment=="production":
+            if not self.pricing_legal_reviewed: raise ValueError("Business/legal pricing review is required before production payment")
             strong("PRODUCTION_PROVIDER_ACTIVATION_ID",self.production_provider_activation_id)
             strong("EXPECTED_STRIPE_ACCOUNT_ID",self.expected_stripe_account_id,8); strong("EXPECTED_EBAY_SELLER_ID",self.expected_ebay_seller_id,6)
             if not self.rate_limit_storage_uri or self.rate_limit_storage_uri=="memory://": raise ValueError("Production requires a shared rate-limit store")
