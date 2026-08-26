@@ -1,4 +1,6 @@
 from .errors import StripeIntegrationError
+from commerce_policy import normalized_policy
+from money import validate_money_set
 
 class StripeAdapter:
     def __init__(self, config):
@@ -7,14 +9,18 @@ class StripeAdapter:
     def create_checkout(self, order, item, success_url, cancel_url):
         import stripe
         try:
+            policy=normalized_policy(self.cfg)
+            amounts=validate_money_set(order["currency_snapshot"],subtotal=order["item_subtotal_amount"],shipping=order["shipping_amount"],tax=order["tax_amount"],total=order["final_total_amount"])
+            if order["currency_snapshot"] != policy["currency"] or amounts["subtotal"]+amounts["shipping"]+amounts["tax"] != amounts["total"]:
+                raise ValueError("immutable order total does not match policy")
             result=stripe.checkout.Session.create(
                 api_key=self.cfg.stripe_secret_key,
                 mode="payment", payment_intent_data={"capture_method":"manual","metadata":{"order":order["public_id"]}},
                 payment_method_types=["card"],
-                automatic_tax={"enabled":False}, tax_id_collection={"enabled":False},
-                shipping_address_collection={"allowed_countries":list(self.cfg.stripe_shipping_countries)},
-                shipping_options=[{"shipping_rate_data":{"type":"fixed_amount","fixed_amount":{"amount":order["shipping_amount"],"currency":order["currency_snapshot"].lower()},"display_name":"Launch shipping (included)"}}],
-                line_items=[{"quantity":1,"price_data":{"currency":order["currency_snapshot"].lower(),"unit_amount":order["item_subtotal_amount"]+order["tax_amount"],"product_data":{"name":item["title"][:120],"description":"Tax-inclusive launch price; shipping included"}}}],
+                automatic_tax={"enabled":policy["tax_mode"]=="automatic"}, tax_id_collection={"enabled":False},
+                shipping_address_collection={"allowed_countries":list(policy["countries"])},
+                shipping_options=[{"shipping_rate_data":{"type":"fixed_amount","fixed_amount":{"amount":amounts["shipping"],"currency":policy["currency"].lower()},"display_name":policy["shipping_wording"]}}],
+                line_items=[{"quantity":1,"price_data":{"currency":policy["currency"].lower(),"unit_amount":amounts["subtotal"]+amounts["tax"],"product_data":{"name":item["title"][:120],"description":policy["tax_wording"]}}}],
                 success_url=success_url, cancel_url=cancel_url, client_reference_id=order["public_id"],
                 idempotency_key=f"checkout:{order['public_id']}")
             return {"id":result.id,"url":result.url,"payment_intent":getattr(result,"payment_intent",None)}

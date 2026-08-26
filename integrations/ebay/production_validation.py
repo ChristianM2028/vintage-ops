@@ -5,10 +5,12 @@ REQUIRED_SCOPES={"https://api.ebay.com/oauth/api_scope/sell.account","https://ap
 
 class ProductionSellerValidator:
     def __init__(self, config, db, client): self.cfg,self.db,self.client=config,db,client
-    def validate(self, token_identity, scopes):
+    def validate(self, token_identity=None, scopes=None):
         if self.cfg.ebay_provider_mode != "production": raise EbayError("configuration","Production validation requires production endpoints")
-        if not token_identity or token_identity != self.cfg.expected_ebay_seller_id: raise EbayError("provider_identity","Production token seller identity mismatch")
-        if not REQUIRED_SCOPES.issubset(set(scopes)): raise EbayError("authentication","Production token is missing required selling scopes")
+        with self.db.connect() as con:
+            row=con.execute("SELECT scopes FROM ebay_tokens WHERE id=1").fetchone()
+        stored_scopes=set((row["scopes"] or "").split()) if row else set(scopes or ())
+        if not REQUIRED_SCOPES.issubset(stored_scopes): raise EbayError("authentication","Production token is missing required selling scopes")
         identity=self.client.request("GET","/commerce/identity/v1/user/")
         if identity.get("username") != self.cfg.expected_ebay_seller_id: raise EbayError("provider_identity","Production seller identity mismatch")
         location=self.client.request("GET",f"/sell/inventory/v1/location/{self.cfg.location_key}")
@@ -17,8 +19,7 @@ class ProductionSellerValidator:
         if any(p.get("marketplaceId") != self.cfg.marketplace_id for p in policies.values()): raise EbayError("configuration","Production policy marketplace mismatch")
         privileges=self.client.request("GET","/sell/account/v1/privilege")
         if privileges.get("sellingLimit",{}).get("amount",{}).get("currency") != self.cfg.currency: raise EbayError("configuration","Production currency or selling privileges mismatch")
-        activation={"activation_id":self.cfg.production_provider_activation_id,"seller_id":identity["username"],"token_identity":token_identity,"marketplace":self.cfg.marketplace_id,"merchant_location_key":self.cfg.location_key,"fulfillment_policy_id":self.cfg.fulfillment_policy_id,"payment_policy_id":self.cfg.payment_policy_id,"return_policy_id":self.cfg.return_policy_id,"currency":self.cfg.currency}
-        return self.db.save_production_activation(activation)
+        return {"ok":True,"provider":"ebay","seller_id":identity["username"],"scopes":sorted(stored_scopes),"marketplace":self.cfg.marketplace_id,"merchant_location_key":self.cfg.location_key,"policy_ids":{"fulfillment":self.cfg.fulfillment_policy_id,"payment":self.cfg.payment_policy_id,"return":self.cfg.return_policy_id},"currency":self.cfg.currency}
 
 def require_production_activation(config, db, token_identity):
     a=db.get_production_activation()

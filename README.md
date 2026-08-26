@@ -537,3 +537,14 @@ manually; the command never restarts the app or overwrites `/data`.
 ### Deprecated provider aliases
 
 `STRIPE_FAKE_MODE`, `MARKETPLACE_MOCK_MODE`, and `EBAY_ENVIRONMENT` are deprecated compatibility inputs. Do not use them to select providers; when explicitly set, startup verifies that they agree with `STRIPE_PROVIDER_MODE` or `EBAY_PROVIDER_MODE`. `SELLER_USERNAME` is a bounded, non-secret identifier (1–64 allowed identifier characters), while `SELLER_PASSWORD_HASH` and provider credentials remain secrets.
+# Production commerce is fail closed
+
+New checkout and eBay publication default to disabled. Production requires a
+complete, explicitly reviewed `COMMERCE_*` policy (including destinations,
+calculation modes/amounts, currency, customer wording, and a real policy ID and
+version). `PRICING_LEGAL_REVIEWED=true` is an additional review acknowledgement;
+it never substitutes for `COMMERCE_POLICY_REVIEWED=true` or complete policy data.
+Operators must validate both provider identities with the read-only
+`flask validate-stripe-production` and `flask validate-ebay-production` commands
+before separately activating a reviewed deployment. Never infer a destination,
+free shipping, zero tax, or tax-inclusive pricing.

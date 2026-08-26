@@ -1,5 +1,6 @@
 import hashlib, hmac, json
 from .errors import StripeIntegrationError
+from money import validate_cents
 
 class FakeStripeAdapter:
     identity = "fake"
@@ -8,7 +9,7 @@ class FakeStripeAdapter:
         self.calls.append({"order":order["public_id"],"amount":order["price_snapshot"],"currency":order["currency_snapshot"],"quantity":1,"name":item["title"]})
         sid="cs_test_"+order["public_id"][:16]; pi="pi_test_"+order["public_id"][:16]
         result={"id":sid,"payment_intent":pi,"url":f"/shop/order/{order['public_id']}"}; self.sessions[sid]=result
-        amount=order.get("final_total_amount",int(round(float(order["price_snapshot"])*100)))
+        amount=validate_cents(order["final_total_amount"],"final_total_amount")
         self.payment_intents[pi]={"id":pi,"status":"requires_capture","capture_method":"manual",
             "amount":amount,"amount_capturable":amount,"amount_received":0,"currency":order["currency_snapshot"].upper()}
         return result
