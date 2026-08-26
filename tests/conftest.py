@@ -1,5 +1,36 @@
-"""Shared high-fidelity storefront order fixtures."""
+"""Shared high-fidelity storefront order fixtures.
+
+Tests opt in to every provider, policy, and mutation switch.  Production
+defaults intentionally remain fail-closed; relying on implicit application
+defaults here made unrelated fixture tests change meaning when a safety switch
+was added.
+"""
+import os
 from dataclasses import replace
+
+_TEST_CONFIGURATION = {
+    "APP_ENVIRONMENT": "local",
+    "STRIPE_PROVIDER_MODE": "fake",
+    "EBAY_PROVIDER_MODE": "mock",
+    "CHECKOUT_ENABLED": "true",
+    "EBAY_LISTING_ENABLED": "true",
+    "PRICING_LEGAL_REVIEWED": "true",
+    "COMMERCE_POLICY_ID": "test-policy",
+    "COMMERCE_POLICY_VERSION": "1",
+    "COMMERCE_CURRENCY": "USD",
+    "COMMERCE_SUPPORTED_COUNTRIES": "US",
+    "COMMERCE_SUPPORTED_REGIONS_JSON": "{}",
+    "COMMERCE_SHIPPING_MODE": "fixed",
+    "COMMERCE_SHIPPING_AMOUNT_CENTS": "0",
+    "COMMERCE_TAX_MODE": "fixed",
+    "COMMERCE_TAX_AMOUNT_CENTS": "0",
+    "COMMERCE_DESTINATION_WORDING": "Ships within the United States",
+    "COMMERCE_SHIPPING_WORDING": "Free shipping",
+    "COMMERCE_TAX_WORDING": "Tax included",
+    "COMMERCE_TOTAL_WORDING": "Order total",
+}
+for _name, _value in _TEST_CONFIGURATION.items():
+    os.environ.setdefault(_name, _value)
 
 import pytest
 from werkzeug.security import generate_password_hash

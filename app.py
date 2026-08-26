@@ -27,6 +27,8 @@ from fulfillment_service import FulfillmentService, FulfillmentError
 from refund_service import RefundService, RefundError
 from manual_resolution_service import ManualResolutionService, ManualResolutionError
 from scheduled_jobs import run_scheduled_job
+from money import format_cents
+from commerce_policy import normalized_policy
 
 IMAGE_SIGNATURES={"jpg":lambda b:b.startswith(b"\xff\xd8\xff"),"jpeg":lambda b:b.startswith(b"\xff\xd8\xff"),"png":lambda b:b.startswith(b"\x89PNG\r\n\x1a\n"),"gif":lambda b:b.startswith((b"GIF87a",b"GIF89a")),"webp":lambda b:len(b)>=12 and b[:4]==b"RIFF" and b[8:12]==b"WEBP"}
 
@@ -99,6 +101,13 @@ def create_app(config=None, http=None, stripe_adapter=None):
         if "csrf_token" not in session: session["csrf_token"]=secrets.token_urlsafe(32)
         return session["csrf_token"]
     app.jinja_env.globals["csrf_token"]=csrf_token
+    app.jinja_env.filters["cents"]=format_cents
+    policy=normalized_policy(cfg)
+    @app.context_processor
+    def commerce_context():
+        return {"commerce_policy":policy,"checkout_available":bool(cfg.checkout_enabled and cfg.commerce_policy_reviewed),
+                "listing_available":bool(cfg.ebay_listing_enabled),"checkout_enabled":cfg.checkout_enabled,
+                "ebay_listing_enabled":cfg.ebay_listing_enabled}
     @app.before_request
     def csrf_protect():
         # Railway's public proxy is used only for scheme/host by explicit hop
@@ -409,8 +418,19 @@ def create_app(config=None, http=None, stripe_adapter=None):
         order=db.get_order(public_id) or abort(404)
         if order["state"]=="sold": return redirect(url_for("order_status",public_id=public_id),code=303)
         if order["state"] not in ("checkout_pending","authorization_pending"): abort(409,"Order can no longer be completed")
-        # Fake checkout models an already-authorized manual-capture intent.
-        order_service.process_authorization(order,payment_intent={"id":order["stripe_payment_intent_id"],"status":"requires_capture","capture_method":"manual"},source="shopper")
+        # Rebuild complete fake-provider snapshots from durable order values.
+        # This keeps restart recovery exact without relaxing the production
+        # authorization validator when money or destination fields are absent.
+        payment_intent={"id":order["stripe_payment_intent_id"],"status":"requires_capture",
+            "capture_method":"manual","amount":order["final_total_amount"],
+            "amount_capturable":order["final_total_amount"],"amount_received":0,
+            "currency":order["currency_snapshot"].upper()}
+        session_obj={"id":order["stripe_checkout_session_id"],"payment_intent":payment_intent,
+            "shipping_details":{"address":{"country":cfg.commerce_supported_countries[0]}}}
+        stripe_gateway.sessions.setdefault(order["stripe_checkout_session_id"],session_obj)
+        stripe_gateway.payment_intents.setdefault(order["stripe_payment_intent_id"],payment_intent)
+        order_service.process_authorization(order,session_obj=session_obj,
+            payment_intent=payment_intent,source="shopper")
         return redirect(url_for("order_status",public_id=public_id),code=303)
 
     @app.post("/shop/order/<public_id>/cancel-checkout")
@@ -669,6 +689,27 @@ def create_app(config=None, http=None, stripe_adapter=None):
     def bounded(value):
         if value < 1 or value > 500: raise click.BadParameter("must be between 1 and 500",param_hint="--limit")
         return value
+    @app.cli.command("validate-stripe-production")
+    def validate_stripe_production():
+        """Read-only validation; this command never activates commerce."""
+        from integrations.stripe.production_validation import ProductionStripeValidator
+        try: result=ProductionStripeValidator(cfg).validate()
+        except Exception as exc:
+            app.logger.error("Stripe production validation failed: %s",type(exc).__name__)
+            raise click.ClickException("Stripe production validation failed") from exc
+        click.echo(json.dumps(result,sort_keys=True))
+
+    @app.cli.command("validate-ebay-production")
+    def validate_ebay_production():
+        """Read-only production seller validation; does not persist activation."""
+        from integrations.ebay.production_validation import ProductionSellerValidator
+        try:
+            oauth,service=real_components(); oauth.access_token()
+            result=ProductionSellerValidator(cfg,db,service.client).validate()
+        except Exception as exc:
+            app.logger.error("eBay production validation failed: %s",type(exc).__name__)
+            raise click.ClickException("eBay production validation failed") from exc
+        click.echo(json.dumps(result,sort_keys=True))
     @app.cli.command("storefront-maintenance")
     @click.option("--limit",type=int,default=100,show_default=True)
     def storefront_maintenance(limit):

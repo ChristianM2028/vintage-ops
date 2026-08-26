@@ -1,4 +1,5 @@
 import json, os, sqlite3, secrets
+from money import decimal_to_cents, validate_money_set
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 
@@ -35,6 +36,18 @@ class Database:
             for name in sorted(n for n in os.listdir(root) if n.endswith(".sql")):
                 if con.execute("SELECT 1 FROM schema_migrations WHERE version=?",(name,)).fetchone(): continue
                 con.executescript(open(os.path.join(root,name), encoding="utf8").read())
+                if name == "018_live_commerce.sql":
+                    rows=con.execute("SELECT id,price_snapshot,currency_snapshot FROM storefront_orders").fetchall()
+                    for row in rows:
+                        cents=decimal_to_cents(row["price_snapshot"])
+                        validate_money_set(str(row["currency_snapshot"]), item_subtotal_amount=cents,
+                                           shipping_amount=0,tax_amount=0,final_total_amount=cents)
+                        con.execute("UPDATE storefront_orders SET item_subtotal_amount=?,shipping_amount=0,tax_amount=0,final_total_amount=? WHERE id=?",(cents,cents,row["id"]))
+                    con.executescript("""CREATE TRIGGER storefront_money_snapshots_immutable
+                    BEFORE UPDATE OF item_subtotal_amount,shipping_amount,tax_amount,final_total_amount,currency_snapshot ON storefront_orders
+                    WHEN OLD.item_subtotal_amount IS NOT NEW.item_subtotal_amount OR OLD.shipping_amount IS NOT NEW.shipping_amount
+                     OR OLD.tax_amount IS NOT NEW.tax_amount OR OLD.final_total_amount IS NOT NEW.final_total_amount OR OLD.currency_snapshot IS NOT NEW.currency_snapshot
+                    BEGIN SELECT RAISE(ABORT,'order pricing snapshots are immutable'); END;""")
                 con.execute("INSERT INTO schema_migrations VALUES (?,?)",(name,now()))
     def acquire_scheduled_job(self, job_name, lease_seconds=240):
         token=secrets.token_urlsafe(32); stamp=now()
@@ -280,7 +293,8 @@ class Database:
             if reservation: raise ValueError("Item reserved")
             c.execute("UPDATE item_reservations SET state='expired',close_reason='expired',updated_at=? WHERE item_id=? AND state='open' AND expires_at<=?",(stamp,item["id"],stamp))
             public_id=secrets.token_urlsafe(24)
-            subtotal=int(round(float(item["price"])*100)); shipping=int(pricing.get("shipping_amount",0)); tax=int(pricing.get("tax_amount",0)); total=subtotal+shipping+tax
+            subtotal=decimal_to_cents(item["price"]); shipping=pricing.get("shipping_amount",0); tax=pricing.get("tax_amount",0); total=subtotal+shipping+tax
+            validate_money_set(str(item["currency"]),item_subtotal_amount=subtotal,shipping_amount=shipping,tax_amount=tax,final_total_amount=total)
             cur=c.execute("INSERT INTO storefront_orders(public_id,item_id,price_snapshot,currency_snapshot,item_subtotal_amount,shipping_amount,tax_amount,final_total_amount,state,stripe_provider_identity,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(public_id,item["id"],item["price"],item["currency"],subtotal,shipping,tax,total,"checkout_pending",provider_identity,stamp,stamp))
             rid=c.execute("INSERT INTO item_reservations(item_id,order_id,state,expires_at,created_at,updated_at) VALUES(?,?,'open',?,?,?)",(item["id"],cur.lastrowid,expiry,stamp,stamp)).lastrowid
             c.execute("UPDATE storefront_orders SET reservation_id=? WHERE id=?",(rid,cur.lastrowid))

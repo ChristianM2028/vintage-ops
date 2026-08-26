@@ -4,6 +4,7 @@ All provider calls happen between short Database method calls; this module never
 holds a SQLite connection while talking to Stripe or eBay.
 """
 import json
+from commerce_policy import normalized_policy, destination_allowed
 
 from integrations.ebay import EbayError
 from integrations.stripe import StripeIntegrationError
@@ -18,8 +19,14 @@ class OrderService:
         self.db, self.stripe, self.ebay_resolver, self.cfg = db, stripe, ebay_resolver, config
 
     def create_checkout(self, sku, prior_id=None):
+        policy=normalized_policy(self.cfg)
         if not self.cfg.checkout_enabled:
             raise StripeIntegrationError("checkout_disabled","New checkouts are temporarily disabled")
+        if self.cfg.app_environment == "production":
+            from integrations.ebay.production_validation import require_production_activation
+            try: require_production_activation(self.cfg,self.db,self.cfg.expected_ebay_seller_id)
+            except EbayError as exc:
+                raise StripeIntegrationError("activation_required","Coordinated production activation is required",ambiguous=False) from exc
         prior = self.db.get_order(prior_id) if prior_id else None
         active=getattr(self.stripe,"identity",self.cfg.stripe_identity)
         if prior and prior.get("stripe_provider_identity") not in (None,active):
@@ -39,7 +46,9 @@ class OrderService:
                     self.db.transition_order(prior["public_id"],"manual_resolution",error=json.dumps(exc.safe_dict()),source="shopper",category="stale_session_review")
                     raise
         identity=getattr(self.stripe,"identity",self.cfg.stripe_identity)
-        order = self.db.create_storefront_order(sku, self.cfg.reservation_seconds, identity, {"shipping_amount":self.cfg.stripe_shipping_amount,"tax_amount":self.cfg.stripe_tax_amount})
+        if policy["shipping_mode"] != "fixed" or policy["tax_mode"] != "fixed":
+            raise StripeIntegrationError("policy_unavailable","Checkout pricing requires a fixed reviewed total")
+        order = self.db.create_storefront_order(sku, self.cfg.reservation_seconds, identity, {"shipping_amount":policy["shipping_amount"],"tax_amount":policy["tax_amount"]})
         item = self.db.get_item(order["item_id"])
         try:
             remote = self.stripe.create_checkout(
@@ -98,7 +107,7 @@ class OrderService:
         country=str(fulfillment.get("shipping_country") or "").upper(); state=str(fulfillment.get("shipping_state") or "").upper()
         if amount != order["final_total_amount"] or currency != order["currency_snapshot"].upper():
             return self.db.transition_order(order["public_id"],"manual_resolution",error='{"kind":"amount_currency_mismatch"}',source=source,category="payment_mismatch")
-        if country not in self.cfg.stripe_shipping_countries or (country=="US" and state not in self.cfg.stripe_shipping_states):
+        if not destination_allowed(normalized_policy(self.cfg),country,state):
             return self._cancel_and_release(order["public_id"],"unavailable","unsupported destination",source)
         if order["state"] in ("checkout_pending", "authorization_pending"):
             try: order = self.db.transition_order(order["public_id"], "authorized", payment_state="authorized", source=source, category="authorization_verified")

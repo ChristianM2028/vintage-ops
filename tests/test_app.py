@@ -31,7 +31,7 @@ def test_item_page_and_sandbox_guard(tmp_path):
 def test_routes_resolve_persisted_real_snapshot_and_local_mock(tmp_path):
     key=Fernet.generate_key().decode()
     cfg=Config(database_path=str(tmp_path/"modes.sqlite"),encryption_key=key,environment="sandbox",
-        ebay_provider_mode="mock",location_key="GLOBAL-CHANGED",fulfillment_policy_id="global-f",
+        ebay_provider_mode="sandbox",location_key="GLOBAL-CHANGED",fulfillment_policy_id="global-f",
         payment_policy_id="global-p",return_policy_id="global-r",marketplace_id="EBAY_GB")
     http=RecordingHTTP([RecordingHTTP.Response(),RecordingHTTP.Response()])
     app=create_app(cfg,http=http); db=app.extensions["vintage_db"]
@@ -63,27 +63,22 @@ def test_routes_resolve_persisted_real_snapshot_and_local_mock(tmp_path):
         assert local_client.post(f"/items/{local['id']}/{action}",data=csrf(local_client)).status_code==302
     assert no_http.calls==[] and b"Local mock" in local_client.get(f"/items/{local['id']}").data
 
-def test_sandbox_creation_persists_normalized_seller_snapshot(tmp_path):
+def test_sandbox_creation_requires_valid_metadata_before_snapshot(tmp_path):
     cfg=Config(database_path=str(tmp_path/"sandbox-create.sqlite"),environment="sandbox",
-               ebay_provider_mode="mock",location_key="changed-global")
+               ebay_provider_mode="sandbox",location_key="changed-global")
     app=create_app(cfg); db=app.extensions["vintage_db"]
     db.save_seller_setup(None,"  fulfill  "," pay "," return "," location "," EBAY_US ")
     client=app.test_client()
     response=client.post("/sandbox",data={**csrf(client),"title":"Coat","description":"D",
         "price":"10","condition":"USED_EXCELLENT","category":"123","category_name":"",
         "photo_url":"https://example.test/coat.jpg"})
-    assert response.status_code==302
-    item=db.inventory()[0]
-    assert [item[k] for k in ("ebay_merchant_location_key","ebay_fulfillment_policy_id",
-        "ebay_payment_policy_id","ebay_return_policy_id","ebay_marketplace_id")]==[
-        "location","fulfill","pay","return","EBAY_US"]
-    # A later global or setup change cannot mutate the item's saved configuration.
-    db.save_seller_setup(None,"new-f","new-p","new-r","new-location","EBAY_GB")
-    assert db.get_item(item["id"])["ebay_merchant_location_key"]=="location"
+    assert response.status_code==200
+    assert db.inventory()==[]
+    assert b"Select a category from the suggestions" in response.data
 
 def test_sandbox_creation_fails_closed_for_missing_or_incomplete_setup(tmp_path):
     app=create_app(Config(database_path=str(tmp_path/"sandbox-closed.sqlite"),environment="sandbox",
-                          ebay_provider_mode="mock"))
+                          ebay_provider_mode="sandbox"))
     db=app.extensions["vintage_db"]; client=app.test_client()
     data={**csrf(client),"title":"Coat","description":"D","price":"10","condition":"USED_EXCELLENT",
           "category":"123","category_name":"","photo_url":"https://example.test/coat.jpg"}

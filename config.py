@@ -1,4 +1,4 @@
-import base64, os, re
+import base64, os, re, json
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -97,18 +97,36 @@ class Config:
     ebay_order_max_orders: int = int(os.getenv("EBAY_ORDER_MAX_ORDERS", "500"))
     business_name: str = os.getenv("BUSINESS_NAME", "Vintage Ops")
     business_address: str = os.getenv("BUSINESS_ADDRESS", "")
-    checkout_enabled: bool = env_bool("CHECKOUT_ENABLED", True)
-    ebay_listing_enabled: bool = env_bool("EBAY_LISTING_ENABLED", True)
+    checkout_enabled: bool = env_bool("CHECKOUT_ENABLED", False)
+    ebay_listing_enabled: bool = env_bool("EBAY_LISTING_ENABLED", False)
     pricing_legal_reviewed: bool = env_bool("PRICING_LEGAL_REVIEWED", False)
-    stripe_shipping_amount: int = int(os.getenv("STRIPE_SHIPPING_AMOUNT_CENTS", "0"))
-    stripe_tax_amount: int = int(os.getenv("STRIPE_TAX_AMOUNT_CENTS", "0"))
-    stripe_shipping_states: tuple = tuple(x.strip().upper() for x in os.getenv("STRIPE_SHIPPING_STATES", "CA").split(",") if x.strip())
-    stripe_shipping_countries: tuple = tuple(
-        country.strip().upper() for country in os.getenv("STRIPE_SHIPPING_COUNTRIES", "US").split(",")
-        if country.strip()
-    )
+    commerce_policy_reviewed: bool = env_bool("COMMERCE_POLICY_REVIEWED", False)
+    commerce_policy_id: str = os.getenv("COMMERCE_POLICY_ID", "").strip()
+    commerce_policy_version: str = os.getenv("COMMERCE_POLICY_VERSION", "").strip()
+    commerce_currency: str = os.getenv("COMMERCE_CURRENCY", "").strip().upper()
+    commerce_supported_countries: tuple = tuple(x.strip().upper() for x in os.getenv("COMMERCE_SUPPORTED_COUNTRIES", "").split(",") if x.strip())
+    commerce_supported_regions: dict = None
+    commerce_shipping_mode: str = os.getenv("COMMERCE_SHIPPING_MODE", "").strip().lower()
+    commerce_shipping_amount: object = None
+    commerce_tax_mode: str = os.getenv("COMMERCE_TAX_MODE", "").strip().lower()
+    commerce_tax_amount: object = None
+    commerce_destination_wording: str = os.getenv("COMMERCE_DESTINATION_WORDING", "").strip()
+    commerce_shipping_wording: str = os.getenv("COMMERCE_SHIPPING_WORDING", "").strip()
+    commerce_tax_wording: str = os.getenv("COMMERCE_TAX_WORDING", "").strip()
+    commerce_total_wording: str = os.getenv("COMMERCE_TOTAL_WORDING", "").strip()
+    commerce_unavailable_wording: str = os.getenv("COMMERCE_UNAVAILABLE_WORDING", "Purchasing is currently unavailable.").strip()
 
     def __post_init__(self):
+        regions_raw=os.getenv("COMMERCE_SUPPORTED_REGIONS_JSON", "{}")
+        try: regions=json.loads(regions_raw)
+        except json.JSONDecodeError as exc: raise ValueError("COMMERCE_SUPPORTED_REGIONS_JSON must be an object") from exc
+        if not isinstance(regions,dict) or any(not isinstance(v,list) for v in regions.values()): raise ValueError("COMMERCE_SUPPORTED_REGIONS_JSON must map countries to region lists")
+        object.__setattr__(self,"commerce_supported_regions",regions)
+        for field,env in (("commerce_shipping_amount","COMMERCE_SHIPPING_AMOUNT_CENTS"),("commerce_tax_amount","COMMERCE_TAX_AMOUNT_CENTS")):
+            raw=os.getenv(env)
+            try: value=None if raw is None or raw.strip()=="" else int(raw)
+            except ValueError as exc: raise ValueError(f"{env} must be integer cents") from exc
+            object.__setattr__(self,field,value)
         if self.app_environment not in {"local","sandbox","production"}:
             raise ValueError("APP_ENVIRONMENT must be local, sandbox, or production")
         stripe_mode=self.stripe_provider_mode
@@ -128,13 +146,11 @@ class Config:
         key=self.stripe_secret_key.strip()
         if stripe_mode=="live" and not key.startswith("sk_live_"): raise ValueError("Stripe live mode requires an sk_live_ key")
         if stripe_mode=="test" and not key.startswith("sk_test_"): raise ValueError("Stripe test mode requires an sk_test_ key")
-        if stripe_mode=="fake" and key.startswith(("sk_live_","sk_test_")): raise ValueError("Stripe fake mode cannot contain a provider key")
         if stripe_mode!="live" and key.startswith("sk_live_"): raise ValueError("Live Stripe keys require validated production mode")
-        if self.stripe_shipping_amount < 0 or self.stripe_tax_amount < 0: raise ValueError("Pricing amounts cannot be negative")
-        if not self.stripe_shipping_states: raise ValueError("At least one supported shipping state is required")
-        if not self.stripe_shipping_countries or any(
-                not re.fullmatch(r"[A-Z]{2}", value) for value in self.stripe_shipping_countries):
-            raise ValueError("Stripe shipping countries must be two-letter country codes")
+        if stripe_mode=="fake" and key.startswith("sk_test_"): raise ValueError("Stripe fake mode cannot contain a provider key")
+        from commerce_policy import validate_policy
+        if self.app_environment=="production" or self.commerce_policy_reviewed or self.commerce_policy_id:
+            validate_policy(self,production=self.app_environment=="production")
         if self.proxy_fix_proto not in (0, 1) or self.proxy_fix_host not in (0, 1):
             raise ValueError("Proxy trust values must be 0 or 1")
         if self.ebay_image_upload_api not in ("media", "trading"):

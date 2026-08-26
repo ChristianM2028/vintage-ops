@@ -13,7 +13,8 @@ def test_recovery_schema_and_fake_intent_are_sanitized_and_idempotent(tmp_path):
         assert {'storefront_resolution_reviews','storefront_resolution_actions','storefront_operation_attempts'} <= tables
         assert 'provider_revision' in {r[1] for r in con.execute('PRAGMA table_info(storefront_orders)')}
     stripe=FakeStripeAdapter(replace(Config(),database_path=str(tmp_path/'unused.sqlite')))
-    order={'public_id':'order-safe','price_snapshot':'12.00','currency_snapshot':'USD'}
+    order={'public_id':'order-safe','price_snapshot':'12.00','currency_snapshot':'USD',
+           'final_total_amount':1200}
     item={'title':'Coat'}
     intent_id=stripe.create_checkout(order,item,'ok','cancel')['payment_intent']
     observed=stripe.retrieve_payment_intent(intent_id)

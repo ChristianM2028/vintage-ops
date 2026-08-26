@@ -52,6 +52,13 @@ import pytest
 
 def _isolated_config(environment):
     root = Path(__file__).resolve().parents[1]
+    environment = {"COMMERCE_POLICY_ID":"provider-matrix","COMMERCE_POLICY_VERSION":"1",
+        "COMMERCE_CURRENCY":"USD","COMMERCE_SUPPORTED_COUNTRIES":"US",
+        "COMMERCE_SUPPORTED_REGIONS_JSON":"{}","COMMERCE_SHIPPING_MODE":"fixed",
+        "COMMERCE_SHIPPING_AMOUNT_CENTS":"0","COMMERCE_TAX_MODE":"fixed",
+        "COMMERCE_TAX_AMOUNT_CENTS":"0","COMMERCE_DESTINATION_WORDING":"US only",
+        "COMMERCE_SHIPPING_WORDING":"Free shipping","COMMERCE_TAX_WORDING":"Tax included",
+        "COMMERCE_TOTAL_WORDING":"Total","COMMERCE_POLICY_REVIEWED":"true", **environment}
     script = "import json; from config import Config; c=Config(); print(json.dumps([c.stripe_identity,c.ebay_integration_identity,c.stripe_is_fake,c.ebay_is_mock]))"
     result = subprocess.run([sys.executable, "-c", script], cwd=root, env=environment,
                             capture_output=True, text=True, check=False)

@@ -25,3 +25,16 @@ may be retained temporarily only when their values agree; startup rejects a
 conflict. `SELLER_USERNAME` is a bounded non-secret identifier, not a credential
 or entropy-bearing secret; continue protecting `SELLER_PASSWORD_HASH` and all
 provider keys.
+# Reviewed commerce policy (fail closed)
+
+1. Record a non-placeholder policy ID/version and obtain documented review.
+2. Configure every `COMMERCE_*` value shown in `.env.example`; explicitly choose
+   fixed/calculated shipping and fixed/automatic tax and approved destinations.
+3. Keep both kill switches false while reviewing. Setting only
+   `PRICING_LEGAL_REVIEWED=true` cannot make checkout available.
+4. Run `flask validate-stripe-production` and
+   `flask validate-ebay-production`. These checks are read-only and a failure or
+   identity mismatch must stop deployment. Do not paste credentials into logs.
+5. Perform the separate coordinated activation for the exact reviewed
+   configuration, then deliberately enable the desired kill switch. Activation
+   must never toggle either switch.
