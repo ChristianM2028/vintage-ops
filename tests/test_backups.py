@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 import os
@@ -51,10 +52,26 @@ def test_cli_creates_restorable_allowlisted_archive(tmp_path, monkeypatch):
         manifest = json.loads(manifest_bytes)
         assert set(manifest) == {
             "format_version", "application", "created_at", "database",
-            "integrity_check", "photo_count", "photos",
+            "integrity_check", "photo_count", "photos", "files",
         }
+        assert isinstance(manifest["files"], list)
+        assert all(set(record) == {"path", "size", "sha256"} for record in manifest["files"])
+        database_bytes = archive.extractfile("database.sqlite3").read()
+        photo_bytes = archive.extractfile("uploads/nested/photo.jpg").read()
+        assert manifest["files"] == [
+            {
+                "path": "database.sqlite3",
+                "size": len(database_bytes),
+                "sha256": hashlib.sha256(database_bytes).hexdigest(),
+            },
+            {
+                "path": "uploads/nested/photo.jpg",
+                "size": len(photo_bytes),
+                "sha256": hashlib.sha256(photo_bytes).hexdigest(),
+            },
+        ]
         snapshot = tmp_path / "restored.sqlite3"
-        snapshot.write_bytes(archive.extractfile("database.sqlite3").read())
+        snapshot.write_bytes(database_bytes)
     assert b"environment-secret-fixture" not in archive_path.read_bytes()
     with sqlite3.connect(snapshot) as connection:
         assert connection.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
