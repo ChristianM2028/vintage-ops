@@ -21,6 +21,25 @@ class ProductionSellerValidator:
         if privileges.get("sellingLimit",{}).get("amount",{}).get("currency") != self.cfg.currency: raise EbayError("configuration","Production currency or selling privileges mismatch")
         return {"ok":True,"provider":"ebay","seller_id":identity["username"],"scopes":sorted(stored_scopes),"marketplace":self.cfg.marketplace_id,"merchant_location_key":self.cfg.location_key,"policy_ids":{"fulfillment":self.cfg.fulfillment_policy_id,"payment":self.cfg.payment_policy_id,"return":self.cfg.return_policy_id},"currency":self.cfg.currency}
 
+def activate_production(config, db, *, stripe_validation, ebay_validation, token_identity):
+    """Persist one coordinated activation after both read-only checks pass."""
+    if not (stripe_validation.get("ok") is True and stripe_validation.get("provider")=="stripe"
+            and stripe_validation.get("livemode") is True
+            and stripe_validation.get("account_id")==config.expected_stripe_account_id):
+        raise EbayError("provider_identity","Validated Stripe identity is required for activation")
+    policies=ebay_validation.get("policy_ids") or {}
+    expected={"seller_id":config.expected_ebay_seller_id,"marketplace":config.marketplace_id,
+        "merchant_location_key":config.location_key,"currency":config.currency}
+    if not (ebay_validation.get("ok") is True and ebay_validation.get("provider")=="ebay"
+            and all(ebay_validation.get(k)==v for k,v in expected.items())
+            and policies=={"fulfillment":config.fulfillment_policy_id,
+                           "payment":config.payment_policy_id,"return":config.return_policy_id}):
+        raise EbayError("provider_identity","Validated eBay identity is required for activation")
+    return db.save_production_activation({"activation_id":config.production_provider_activation_id,
+        **expected,"fulfillment_policy_id":config.fulfillment_policy_id,
+        "payment_policy_id":config.payment_policy_id,"return_policy_id":config.return_policy_id,
+        "token_identity":token_identity})
+
 def require_production_activation(config, db, token_identity):
     a=db.get_production_activation()
     expected={"activation_id":config.production_provider_activation_id,"seller_id":config.expected_ebay_seller_id,"token_identity":token_identity,"marketplace":config.marketplace_id,"merchant_location_key":config.location_key,"fulfillment_policy_id":config.fulfillment_policy_id,"payment_policy_id":config.payment_policy_id,"return_policy_id":config.return_policy_id,"currency":config.currency}

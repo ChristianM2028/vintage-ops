@@ -418,8 +418,19 @@ def create_app(config=None, http=None, stripe_adapter=None):
         order=db.get_order(public_id) or abort(404)
         if order["state"]=="sold": return redirect(url_for("order_status",public_id=public_id),code=303)
         if order["state"] not in ("checkout_pending","authorization_pending"): abort(409,"Order can no longer be completed")
-        # Fake checkout models an already-authorized manual-capture intent.
-        order_service.process_authorization(order,payment_intent={"id":order["stripe_payment_intent_id"],"status":"requires_capture","capture_method":"manual"},source="shopper")
+        # Rebuild complete fake-provider snapshots from durable order values.
+        # This keeps restart recovery exact without relaxing the production
+        # authorization validator when money or destination fields are absent.
+        payment_intent={"id":order["stripe_payment_intent_id"],"status":"requires_capture",
+            "capture_method":"manual","amount":order["final_total_amount"],
+            "amount_capturable":order["final_total_amount"],"amount_received":0,
+            "currency":order["currency_snapshot"].upper()}
+        session_obj={"id":order["stripe_checkout_session_id"],"payment_intent":payment_intent,
+            "shipping_details":{"address":{"country":cfg.commerce_supported_countries[0]}}}
+        stripe_gateway.sessions.setdefault(order["stripe_checkout_session_id"],session_obj)
+        stripe_gateway.payment_intents.setdefault(order["stripe_payment_intent_id"],payment_intent)
+        order_service.process_authorization(order,session_obj=session_obj,
+            payment_intent=payment_intent,source="shopper")
         return redirect(url_for("order_status",public_id=public_id),code=303)
 
     @app.post("/shop/order/<public_id>/cancel-checkout")

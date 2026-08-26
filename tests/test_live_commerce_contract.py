@@ -4,7 +4,8 @@ from types import SimpleNamespace
 import pytest
 from db import Database
 from integrations.ebay.errors import EbayError
-from integrations.ebay.production_validation import ProductionSellerValidator, require_production_activation
+from integrations.ebay.production_validation import (ProductionSellerValidator,
+    activate_production, require_production_activation)
 
 
 def test_money_snapshots_are_immutable(tmp_path):
@@ -27,7 +28,10 @@ class Client:
         raise AssertionError(path)
 
 def cfg(**changes):
-    values=dict(ebay_provider_mode='production',environment='production',expected_ebay_seller_id='seller',production_provider_activation_id='activation',marketplace_id='EBAY_US',location_key='loc',fulfillment_policy_id='f',payment_policy_id='p',return_policy_id='r',currency='USD')
+    values=dict(ebay_provider_mode='production',environment='production',expected_ebay_seller_id='seller',
+        expected_stripe_account_id='acct_expected',production_provider_activation_id='activation',
+        marketplace_id='EBAY_US',location_key='loc',fulfillment_policy_id='f',
+        payment_policy_id='p',return_policy_id='r',currency='USD')
     values.update(changes); return SimpleNamespace(**values)
 
 def test_production_validation_is_read_only_and_identity_bound(tmp_path):
@@ -35,6 +39,11 @@ def test_production_validation_is_read_only_and_identity_bound(tmp_path):
     scopes={'https://api.ebay.com/oauth/api_scope/sell.account','https://api.ebay.com/oauth/api_scope/sell.inventory','https://api.ebay.com/oauth/api_scope/sell.fulfillment'}
     activation=ProductionSellerValidator(cfg(),db,Client()).validate('seller',scopes)
     assert activation['seller_id']=='seller'
+    assert db.get_production_activation() is None
+    activate_production(cfg(),db,stripe_validation={'ok':True,'provider':'stripe',
+        'livemode':True,'account_id':'acct_expected'},ebay_validation=activation,
+        token_identity='seller')
     require_production_activation(cfg(),db,'seller')
     with pytest.raises(EbayError): require_production_activation(cfg(payment_policy_id='changed'),db,'seller')
-    with pytest.raises(EbayError): ProductionSellerValidator(cfg(),db,Client()).validate('other',scopes)
+    with pytest.raises(EbayError):
+        ProductionSellerValidator(cfg(expected_ebay_seller_id='other'),db,Client()).validate('other',scopes)

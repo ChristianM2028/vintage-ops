@@ -90,6 +90,7 @@ def test_upload_path_must_be_directory(tmp_path):
 def test_health_is_public_and_non_sensitive(tmp_path):
     cfg=deployment_config(tmp_path,seller_username="seller",
                           seller_password_hash=generate_password_hash("secret"),
+                          stripe_provider_mode="test",
                           stripe_secret_key="sk_test_do_not_disclose")
     response=create_app(cfg).test_client().get("/healthz")
     assert response.status_code==200

@@ -25,15 +25,16 @@ def test_real_checkout_is_card_only_manual_capture_and_collects_shipping(monkeyp
             captured.update(kwargs)
             return SimpleNamespace(id="cs_test_one", url="https://checkout.stripe.test/one", payment_intent=None)
     monkeypatch.setitem(sys.modules, "stripe", SimpleNamespace(checkout=SimpleNamespace(Session=Sessions)))
-    cfg = replace(Config(), stripe_provider_mode="test", stripe_secret_key="sk_test_example",
-                  stripe_shipping_countries=("US", "CA"))
+    cfg = replace(Config(), stripe_provider_mode="test", stripe_secret_key="sk_test_example")
     result = StripeAdapter(cfg).create_checkout(
-        {"public_id":"public","currency_snapshot":"USD","price_snapshot":"12.34"},
+        {"public_id":"public","currency_snapshot":"USD","price_snapshot":"12.34",
+         "item_subtotal_amount":1234,"shipping_amount":0,"tax_amount":0,
+         "final_total_amount":1234},
         {"title":"Coat"}, "https://example.test/success", "https://example.test/cancel")
     assert result["payment_intent"] is None
     assert captured["payment_method_types"] == ["card"]
     assert captured["payment_intent_data"]["capture_method"] == "manual"
-    assert captured["shipping_address_collection"] == {"allowed_countries":["US","CA"]}
+    assert captured["shipping_address_collection"] == {"allowed_countries":["US"]}
     assert captured["line_items"][0]["price_data"]["unit_amount"] == 1234
 
 
@@ -48,7 +49,7 @@ def test_webhook_attaches_intent_sells_and_audits_without_public_pii(tmp_path):
     response=shopper.post("/shop/item/AUDIT-1/checkout",data={"csrf_token":"token"})
     public_id=response.headers["Location"].rsplit("/",1)[-1]
     order=db.get_order(public_id)
-    event={"id":"evt_one","type":"payment_intent.amount_capturable_updated","data":{"object":{"id":order["stripe_payment_intent_id"],"status":"requires_capture","capture_method":"manual","metadata":{"order":public_id}}}}
+    event={"id":"evt_one","type":"payment_intent.amount_capturable_updated","data":{"object":{"id":order["stripe_payment_intent_id"],"status":"requires_capture","capture_method":"manual","amount":order["final_total_amount"],"currency":"usd","metadata":{"order":public_id}}}}
     body=json.dumps(event).encode(); signature=hmac.new(cfg.stripe_webhook_secret.encode(),body,hashlib.sha256).hexdigest()
     assert shopper.post("/stripe/webhook",data=body,headers={"Stripe-Signature":signature,"Content-Type":"application/json"}).status_code==200
     assert db.get_order(public_id)["state"]=="sold"

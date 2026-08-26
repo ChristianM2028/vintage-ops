@@ -146,8 +146,8 @@ class Config:
         key=self.stripe_secret_key.strip()
         if stripe_mode=="live" and not key.startswith("sk_live_"): raise ValueError("Stripe live mode requires an sk_live_ key")
         if stripe_mode=="test" and not key.startswith("sk_test_"): raise ValueError("Stripe test mode requires an sk_test_ key")
-        if stripe_mode=="fake" and key.startswith(("sk_live_","sk_test_")): raise ValueError("Stripe fake mode cannot contain a provider key")
         if stripe_mode!="live" and key.startswith("sk_live_"): raise ValueError("Live Stripe keys require validated production mode")
+        if stripe_mode=="fake" and key.startswith("sk_test_"): raise ValueError("Stripe fake mode cannot contain a provider key")
         from commerce_policy import validate_policy
         if self.app_environment=="production" or self.commerce_policy_reviewed or self.commerce_policy_id:
             validate_policy(self,production=self.app_environment=="production")
