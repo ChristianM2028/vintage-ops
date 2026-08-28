@@ -133,6 +133,24 @@ def test_seller_stylesheet_is_same_origin_and_csp_compatible(tmp_path):
     assert b".inventory-row" in stylesheet.data
 
 
+def test_csp_allows_only_self_and_stripe_checkout_for_form_navigation(tmp_path):
+    response=create_app(deployment_config(tmp_path)).test_client().get("/shop")
+    directives={directive.split()[0]:directive.split()[1:]
+                for directive in response.headers["Content-Security-Policy"].split("; ")}
+
+    assert directives["form-action"] == ["'self'", "https://checkout.stripe.com"]
+    assert directives == {
+        "default-src":["'self'"],
+        "img-src":["'self'", "https:", "data:"],
+        "style-src":["'self'"],
+        "script-src":["'self'"],
+        "object-src":["'none'"],
+        "base-uri":["'self'"],
+        "frame-ancestors":["'none'"],
+        "form-action":["'self'", "https://checkout.stripe.com"],
+    }
+
+
 def _origin_app(tmp_path, **values):
     app=create_app(deployment_config(tmp_path,**values))
     app.add_url_rule("/_origin", "origin", lambda: url_for("healthz",_external=True))

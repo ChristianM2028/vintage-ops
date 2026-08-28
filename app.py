@@ -158,7 +158,7 @@ def create_app(config=None, http=None, stripe_adapter=None):
     @app.after_request
     def security_headers(response):
         response.headers["X-Content-Type-Options"]="nosniff"
-        response.headers["Content-Security-Policy"]="default-src 'self'; img-src 'self' https: data:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+        response.headers["Content-Security-Policy"]="default-src 'self'; img-src 'self' https: data:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self' https://checkout.stripe.com"
         response.headers["Referrer-Policy"]="no-referrer"
         response.headers["Permissions-Policy"]="camera=(), microphone=(), geolocation=()"
         if cfg.app_environment=="production" and cfg.canonical_origin.startswith("https://"):
