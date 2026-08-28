@@ -124,9 +124,37 @@ class Database:
         finally: con.close()
     def create_item(self, photos=None, **v):
         """Atomically allocate the next human-readable SKU and insert photo metadata."""
+        return self._create_item(photos, v)
+
+    def create_seller_item(self, provider_mode, photos=None, **v):
+        """Create an item with the authoritative provider snapshot in one transaction."""
+        if provider_mode not in {"mock", "sandbox", "production"}:
+            raise SellerSetupError("The configured eBay provider mode is invalid.")
+        return self._create_item(photos, v, provider_mode)
+
+    def _create_item(self, photos, v, provider_mode=None):
         stamp=now(); fields=("title","description","price","currency","quantity","condition","brand","size","color","category","category_name","photo_urls","item_specifics","ebay_integration_mode","ebay_merchant_location_key","ebay_fulfillment_policy_id","ebay_payment_policy_id","ebay_return_policy_id","ebay_marketplace_id")
-        vals=[json.dumps(v.get(k, [] if k=="photo_urls" else {})) if k in ("photo_urls","item_specifics") else v.get(k) for k in fields]
         with self.transaction(immediate=True) as c:
+            if provider_mode:
+                identity={"mock":"local_mock","sandbox":"ebay_sandbox","production":"ebay_production"}[provider_mode]
+                v["ebay_integration_mode"]=identity
+                if provider_mode != "mock":
+                    table="ebay_seller_setup" if provider_mode=="sandbox" else "ebay_production_activations"
+                    rows=c.execute(f"SELECT * FROM {table}").fetchall()
+                    if len(rows)!=1:
+                        raise SellerSetupError(f"Exactly one active eBay {provider_mode.title()} seller configuration is required before creating an item.")
+                    setup=dict(rows[0]); source={
+                        "ebay_merchant_location_key":"merchant_location_key",
+                        "ebay_fulfillment_policy_id":"fulfillment_policy_id",
+                        "ebay_payment_policy_id":"payment_policy_id",
+                        "ebay_return_policy_id":"return_policy_id",
+                        "ebay_marketplace_id":"marketplace",
+                    }
+                    snapshot={target:str(setup.get(origin) or "").strip() for target,origin in source.items()}
+                    if any(not value for value in snapshot.values()):
+                        raise SellerSetupError(f"The active eBay {provider_mode.title()} seller configuration is incomplete. Complete seller setup before creating an item.")
+                    v.update(snapshot)
+            vals=[json.dumps(v.get(k, [] if k=="photo_urls" else {})) if k in ("photo_urls","item_specifics") else v.get(k) for k in fields]
             # Explicit SKUs remain accepted for the isolated legacy Sandbox test
             # harness; the seller workflow never accepts or sends one.
             sku=v.get("sku")

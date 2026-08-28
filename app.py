@@ -311,7 +311,10 @@ def create_app(config=None, http=None, stripe_adapter=None):
                 try:
                     for name,_,data in prepared: (upload_dir/name).write_bytes(data); saved.append(upload_dir/name)
                     photo_urls=[url_for("media",filename=name,_external=True) for name,_,_ in prepared]
-                    item=db.create_item(title=values["title"].strip(),description=values["description"].strip(),price=values["price"],currency=cfg.currency,quantity=1,condition=values["condition"].strip(),brand=values.get("brand","").strip(),size=values.get("size","").strip(),color=values.get("color","").strip(),category=values["category"].strip(),category_name=values["category_name"].strip(),item_specifics=specifics,photo_urls=photo_urls,photos=[{"filename":n,"original_filename":o} for n,o,_ in prepared])
+                    item=db.create_seller_item(cfg.ebay_provider_mode,title=values["title"].strip(),description=values["description"].strip(),price=values["price"],currency=cfg.currency,quantity=1,condition=values["condition"].strip(),brand=values.get("brand","").strip(),size=values.get("size","").strip(),color=values.get("color","").strip(),category=values["category"].strip(),category_name=values["category_name"].strip(),item_specifics=specifics,photo_urls=photo_urls,photos=[{"filename":n,"original_filename":o} for n,o,_ in prepared])
+                except SellerSetupError as error:
+                    for path in saved: path.unlink(missing_ok=True)
+                    errors.append(str(error))
                 except Exception:
                     for path in saved: path.unlink(missing_ok=True)
                     errors.append("The item could not be saved. Uploaded files were cleaned up.")
