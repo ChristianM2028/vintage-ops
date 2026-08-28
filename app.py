@@ -308,10 +308,23 @@ def create_app(config=None, http=None, stripe_adapter=None):
                     for name,_,data in prepared: (upload_dir/name).write_bytes(data); saved.append(upload_dir/name)
                     photo_urls=[url_for("media",filename=name,_external=True) for name,_,_ in prepared]
                     item=db.create_item(title=values["title"].strip(),description=values["description"].strip(),price=values["price"],currency=cfg.currency,quantity=1,condition=values["condition"].strip(),brand=values.get("brand","").strip(),size=values.get("size","").strip(),color=values.get("color","").strip(),category=values["category"].strip(),category_name=values["category_name"].strip(),item_specifics=specifics,photo_urls=photo_urls,photos=[{"filename":n,"original_filename":o} for n,o,_ in prepared])
-                    flash(f"Created {item['sku']}","success"); return redirect(url_for("item_page",item_id=item["id"]))
                 except Exception:
                     for path in saved: path.unlink(missing_ok=True)
                     errors.append("The item could not be saved. Uploaded files were cleaned up.")
+                else:
+                    # The canonical item and storefront are the durable primary
+                    # result. A channel outage must not undo either of them.
+                    item=db.update_item(item["id"],status="Active",storefront_visible=1)
+                    try:
+                        adapter,item=resolve_ebay(item,establish=True)
+                        if item.get("ebay_integration_mode")!="local_mock" and item.get("photos"):
+                            EbayImagePublisher(adapter.cfg,db,adapter.client).publish(item); item=db.get_item(item["id"])
+                        adapter.list(item)
+                        flash(f"Listed {item['sku']}. Storefront: Live. eBay: Published.","success")
+                    except EbayError as e:
+                        db.update_item(item["id"],last_error=json.dumps(e.safe_dict()))
+                        flash(f"Listed {item['sku']}. Storefront: Live. eBay: Needs attention — {e}","error")
+                    return redirect(url_for("item_page",item_id=item["id"]))
             for error in errors: flash(error,"error")
         return render_template("create_item.html",values=values,max_photos=cfg.max_photo_count,extensions=cfg.permitted_image_extensions,submitted_specifics=submitted_specifics())
 
