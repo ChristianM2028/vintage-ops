@@ -130,8 +130,12 @@ def create_app(config=None, http=None, stripe_adapter=None):
             if not expected or not secrets.compare_digest(expected, request.form.get("csrf_token", "")): abort(400,"Invalid CSRF token")
             if request.mimetype not in {"application/x-www-form-urlencoded","multipart/form-data"}: abort(415,"Form content type required")
             if session.get("seller_authenticated"):
-                source=request.headers.get("Origin") or request.headers.get("Referer")
-                if cfg.canonical_origin and (not source or (urlsplit(source).scheme,urlsplit(source).netloc)!=(urlsplit(cfg.canonical_origin).scheme,urlsplit(cfg.canonical_origin).netloc)):
+                origin=request.headers.get("Origin")
+                source=request.headers.get("Referer") if not origin or origin.strip().lower()=="null" else origin
+                source_origin=(urlsplit(source).scheme,urlsplit(source).netloc) if source else None
+                canonical_origin=urlsplit(cfg.canonical_origin)
+                same_origin_fetch=not source and request.headers.get("Sec-Fetch-Site","").strip().lower()=="same-origin"
+                if cfg.canonical_origin and source_origin!=(canonical_origin.scheme,canonical_origin.netloc) and not same_origin_fetch:
                     abort(403,"Untrusted request origin")
 
     public_endpoints={"healthz","readyz","privacy","terms","shop","shop_item","media","checkout","order_status","order_success","order_cancel","fake_complete_order","fake_cancel_order","stripe_webhook","scheduled_maintenance","scheduled_backup","static","login"}
