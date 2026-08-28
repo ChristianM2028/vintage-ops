@@ -15,10 +15,12 @@ def csrf(client):
     return {"csrf_token": "storefront-test"}
 
 
-def setup_store(tmp_path, **overrides):
-    cfg = replace(Config(), database_path=str(tmp_path / "store.sqlite"),
-                  stripe_provider_mode="fake", environment="sandbox", **overrides)
-    app = create_app(cfg)
+def setup_store(tmp_path, stripe_adapter=None, **overrides):
+    values={"database_path":str(tmp_path / "store.sqlite"),
+            "stripe_provider_mode":"fake", "environment":"sandbox"}
+    values.update(overrides)
+    cfg = replace(Config(), **values)
+    app = create_app(cfg, stripe_adapter=stripe_adapter)
     db = app.extensions["vintage_db"]
     item = db.create_item(sku="TEST-COAT", title="Test Coat", description="A coat",
                           price="45.00", currency="USD", quantity=1,
@@ -34,6 +36,24 @@ def start_checkout(app, sku="TEST-COAT"):
     assert response.status_code == 303
     public_id = response.headers["Location"].rstrip("/").rsplit("/", 1)[-1]
     return client, public_id
+
+
+def test_checkout_redirect_and_csp_allow_stripe_hosted_checkout(tmp_path):
+    class HostedCheckoutAdapter(FakeStripeAdapter):
+        def create_checkout(self, *args, **kwargs):
+            checkout=super().create_checkout(*args, **kwargs)
+            checkout["url"]="https://checkout.stripe.com/c/pay/cs_test_regression"
+            return checkout
+
+    cfg=replace(Config(), stripe_provider_mode="test", stripe_secret_key="sk_test_example")
+    app, _, _=setup_store(tmp_path, stripe_adapter=HostedCheckoutAdapter(cfg),
+                          stripe_provider_mode="test", stripe_secret_key="sk_test_example")
+    client=app.test_client()
+    response=client.post("/shop/item/TEST-COAT/checkout", data=csrf(client))
+
+    assert response.status_code == 303
+    assert response.headers["Location"] == "https://checkout.stripe.com/c/pay/cs_test_regression"
+    assert "form-action 'self' https://checkout.stripe.com" in response.headers["Content-Security-Policy"]
 
 
 def reservation(db, public_id):
