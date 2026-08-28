@@ -58,3 +58,15 @@ def test_migration_never_changes_offered_listed_or_published_rows(tmp_path):
     with db.connect() as con:
         after=[bytes(con.execute("SELECT quote(json_object('id',id,'sku',sku,'offer',ebay_offer_id,'listing',ebay_listing_id,'publication',ebay_publication_state,'location',ebay_merchant_location_key,'error',last_error)) FROM items WHERE id=?",(item["id"],)).fetchone()[0],"utf8") for item in rows]
     assert after==before
+
+def test_repair_migration_preserves_remote_identity_while_fixing_regressed_item(tmp_path):
+    db=Database(str(tmp_path/"repair.sqlite")); db.migrate(); setup(db)
+    error=json.dumps({"code":"classification_required","message":"This item is missing its persisted eBay seller configuration"})
+    item=add_item(db,"VO-000001",ebay_offer_id="offer-keep",ebay_listing_id="listing-keep",
+                  ebay_publication_state="published",last_error=error)
+    with db.connect() as con:
+        con.executescript((ROOT/"migrations/020_repair_regressed_sandbox_snapshots.sql").read_text())
+    repaired=db.get_item(item["id"])
+    assert (repaired["ebay_offer_id"],repaired["ebay_listing_id"],repaired["ebay_publication_state"])==(
+        "offer-keep","listing-keep","published")
+    assert repaired["ebay_merchant_location_key"]=="LOC" and repaired["last_error"] is None
