@@ -1,4 +1,5 @@
 import io
+import time
 from concurrent.futures import ThreadPoolExecutor
 from config import Config
 from db import Database
@@ -37,6 +38,29 @@ def listing_form(token, title="Jacket"):
     return {"csrf_token":token,"title":title,"description":"Nice","price":"20.00",
             "condition":"Used","category":"Coats","brand":"B","size":"M","color":"Red",
             "photos":[(io.BytesIO(png),"one.png"),(io.BytesIO(png),"two.png")]}
+
+
+def test_seller_post_origin_validation_handles_opaque_origins(tmp_path):
+    from app import create_app
+    cfg=Config(database_path=str(tmp_path/"origin.sqlite"),upload_directory=str(tmp_path/"uploads"),
+               canonical_origin="https://shop.example")
+    app=create_app(cfg); app.testing=True; client=app.test_client(); token=csrf(client)
+    with client.session_transaction() as session:
+        session["seller_authenticated"]=True
+        session["generation"]=cfg.session_generation
+        session["login_at"]=session["last_activity"]=int(time.time())
+
+    def post(headers):
+        return client.post("/",data={"csrf_token":token},headers=headers,
+                           content_type="multipart/form-data")
+
+    assert post({"Origin":"https://shop.example"}).status_code==200
+    assert post({"Origin":"https://attacker.example"}).status_code==403
+    assert post({"Origin":"null","Sec-Fetch-Site":"same-origin"}).status_code==200
+    assert post({"Origin":"null","Sec-Fetch-Site":"cross-site"}).status_code==403
+    assert post({"Origin":"null","Sec-Fetch-Site":"unknown"}).status_code==403
+    assert post({"Origin":"null"}).status_code==403
+    assert post({}).status_code==403
 
 
 def test_create_validation_photos_inventory_and_actions(tmp_path):
