@@ -32,23 +32,62 @@ def csrf(client):
     return page.split('name="csrf_token" value="',1)[1].split('"',1)[0]
 
 
+def listing_form(token, title="Jacket"):
+    png=b"\x89PNG\r\n\x1a\n"+b"safe"
+    return {"csrf_token":token,"title":title,"description":"Nice","price":"20.00",
+            "condition":"Used","category":"Coats","brand":"B","size":"M","color":"Red",
+            "photos":[(io.BytesIO(png),"one.png"),(io.BytesIO(png),"two.png")]}
+
+
 def test_create_validation_photos_inventory_and_actions(tmp_path):
     from app import create_app
     cfg=Config(database_path=str(tmp_path/"app.sqlite"),upload_directory=str(tmp_path/"uploads"),ebay_provider_mode="mock")
     app=create_app(cfg); app.testing=True; client=app.test_client()
     token=csrf(client); bad=client.post("/",data={"csrf_token":token,"title":"Remember me"},content_type="multipart/form-data")
     assert bad.status_code==200 and b"Remember me" in bad.data and b"Price is required" in bad.data
-    png=b"\x89PNG\r\n\x1a\n"+b"safe"
-    data={"csrf_token":token,"title":"Jacket","description":"Nice","price":"20.00","condition":"Used","category":"Coats","brand":"B","size":"M","color":"Red","photos":[(io.BytesIO(png),"one.png"),(io.BytesIO(png),"two.png")]}
-    made=client.post("/",data=data,content_type="multipart/form-data",follow_redirects=True)
-    assert made.status_code==200 and b"VO-000001" in made.data
-    inventory=client.get("/inventory"); assert b"Jacket" in inventory.data and b"Draft" in inventory.data
+    made=client.post("/",data=listing_form(token),content_type="multipart/form-data",follow_redirects=True)
+    assert made.status_code==200 and b"VO-000001" in made.data and b"Storefront: Live" in made.data and b"eBay: Published" in made.data
+    inventory=client.get("/inventory"); assert b"Jacket" in inventory.data and b"Active" in inventory.data
     item=app.extensions["vintage_db"].inventory()[0]
+    assert item["storefront_visible"]==1 and item["ebay_publication_state"]=="published"
     listed=client.post(f"/items/{item['id']}/list-everywhere",data={"csrf_token":token},follow_redirects=True)
     refreshed=app.extensions["vintage_db"].get_item(item["id"])
     assert b"Listed on every configured marketplace (eBay)" in listed.data and refreshed["status"]=="Active" and "depop" not in str(refreshed).lower()
     sold=client.post(f"/items/{item['id']}/sold-delist-everywhere",data={"csrf_token":token})
     assert sold.status_code==302 and app.extensions["vintage_db"].get_item(item["id"])["status"]=="Sold"
+
+
+def test_list_item_keeps_storefront_live_when_ebay_fails(tmp_path,monkeypatch):
+    from app import create_app
+    from integrations.ebay.errors import EbayError
+    def unavailable(self,item): raise EbayError("remote","eBay is unavailable")
+    monkeypatch.setattr(MockEbayAdapter,"list",unavailable)
+    app=create_app(Config(database_path=str(tmp_path/"failure.sqlite"),upload_directory=str(tmp_path/"uploads"),ebay_provider_mode="mock"))
+    app.testing=True; client=app.test_client(); token=csrf(client)
+    response=client.post("/",data=listing_form(token),content_type="multipart/form-data",follow_redirects=True)
+    item=app.extensions["vintage_db"].inventory()[0]
+    assert response.status_code==200 and b"Storefront: Live" in response.data and b"eBay: Needs attention" in response.data
+    assert item["status"]=="Active" and item["storefront_visible"]==1 and item["ebay_listing_id"] is None
+    assert b"Jacket" in client.get("/shop").data
+
+
+def test_retry_after_ambiguous_success_reuses_ebay_offer(tmp_path,monkeypatch):
+    from app import create_app
+    from integrations.ebay.errors import EbayError
+    original=MockEbayAdapter.list; calls=[]
+    def ambiguous_once(self,item):
+        listed=original(self,item); calls.append(listed["ebay_offer_id"])
+        if len(calls)==1: raise EbayError("remote","response was lost")
+        return listed
+    monkeypatch.setattr(MockEbayAdapter,"list",ambiguous_once)
+    app=create_app(Config(database_path=str(tmp_path/"retry.sqlite"),upload_directory=str(tmp_path/"uploads"),ebay_provider_mode="mock"))
+    app.testing=True; client=app.test_client(); token=csrf(client)
+    client.post("/",data=listing_form(token),content_type="multipart/form-data")
+    item=app.extensions["vintage_db"].inventory()[0]; first_offer=item["ebay_offer_id"]
+    response=client.post(f"/items/{item['id']}/list-ebay",data={"csrf_token":token},follow_redirects=True)
+    retried=app.extensions["vintage_db"].get_item(item["id"])
+    assert response.status_code==200 and b"Listed on eBay" in response.data
+    assert calls==[first_offer,first_offer] and retried["ebay_offer_id"]==first_offer and retried["ebay_publication_state"]=="published"
 
 
 def test_mock_mode_can_be_disabled(tmp_path):
