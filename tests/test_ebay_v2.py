@@ -194,3 +194,70 @@ def test_order_reconciliation_is_idempotent_and_removes_sold_stock(tmp_path):
     service=EbayService(cfg,db,Client([{'orders':[order]},{'orders':[order]}])); service.reconcile_orders(); service.reconcile_orders()
     sold=db.get_item(item['id']); assert sold['status']=='Sold' and sold['quantity']==0 and sold['storefront_visible']==0
     with db.connect() as c: assert c.execute('select count(*) from ebay_order_lines').fetchone()[0]==1
+
+def recovery_item(db, sku):
+    return db.create_item(sku=sku,title='Vintage coat',description='Exact description',price='19.00',
+        currency='USD',quantity=1,condition='USED',category='1',photo_urls=['https://cdn/x'])
+
+def recovery_offer(local_sku, status='UNPUBLISHED', **changes):
+    offer={'offerId':'SAFE-OFFER','sku':local_sku,'marketplaceId':'EBAY_US','format':'FIXED_PRICE',
+        'availableQuantity':1,'categoryId':'1','merchantLocationKey':'loc',
+        'listingDescription':'Exact description','pricingSummary':{'price':{'value':'19.0','currency':'USD'}},
+        'listingPolicies':{'fulfillmentPolicyId':'f','paymentPolicyId':'p','returnPolicyId':'r'},
+        'status':status}
+    offer.update(changes)
+    return offer
+
+def test_vo_000005_inspects_exact_sandbox_offer_then_publishes_once(tmp_path):
+    cfg,db=make(tmp_path); item=recovery_item(db,'VO-000005')
+    client=Client([{'offers':[recovery_offer(item['sku'])]},{'listingId':'SAFE-LISTING'}])
+
+    recovered=EbayService(cfg,db,client).recover_offer(item)
+
+    assert (recovered['ebay_offer_id'],recovered['ebay_listing_id'],recovered['ebay_publication_state'])==(
+        'SAFE-OFFER','SAFE-LISTING','published')
+    assert [call[0] for call in client.calls]==[
+        ('GET','/sell/inventory/v1/offer?sku=VO-000005&marketplace_id=EBAY_US'),
+        ('POST','/sell/inventory/v1/offer/SAFE-OFFER/publish')]
+
+def test_vo_000006_adopts_already_published_offer_without_remote_mutation(tmp_path):
+    cfg,db=make(tmp_path); item=recovery_item(db,'VO-000006')
+    remote=recovery_offer(item['sku'],'PUBLISHED',listing={'listingId':'EXISTING-LISTING'})
+    client=Client([{'offers':[remote]}])
+
+    recovered=EbayService(cfg,db,client).recover_offer(item)
+
+    assert (recovered['ebay_offer_id'],recovered['ebay_listing_id'],recovered['ebay_publication_state'])==(
+        'SAFE-OFFER','EXISTING-LISTING','published')
+    assert [call[0] for call in client.calls]==[
+        ('GET','/sell/inventory/v1/offer?sku=VO-000006&marketplace_id=EBAY_US')]
+
+@pytest.mark.parametrize(('change','reason'),[
+    ({'sku':'VO-WRONG'},'sku_mismatch'),
+    ({'marketplaceId':'EBAY_GB'},'marketplace_mismatch'),
+    ({'merchantLocationKey':'other'},'merchant_location_key_mismatch'),
+    ({'listingPolicies':{'fulfillmentPolicyId':'wrong','paymentPolicyId':'p','returnPolicyId':'r'}},'fulfillmentPolicyId_mismatch'),
+    ({'pricingSummary':{'price':{'value':'20.00','currency':'USD'}}},'price_value_mismatch'),
+])
+def test_offer_recovery_mismatch_is_sanitized_and_strictly_read_only(tmp_path,change,reason):
+    cfg,db=make(tmp_path); item=recovery_item(db,'VO-000006'); original=dict(item)
+    client=Client([{'offers':[recovery_offer(item['sku'],**change)]}])
+
+    with pytest.raises(EbayError) as error: EbayService(cfg,db,client).recover_offer(item)
+
+    saved=db.get_item(item['id']); inspection=json.loads(saved['last_error'])['inspection']
+    assert error.value.kind=='manual_resolution' and reason in inspection['offers'][0]['reason']
+    assert set(inspection['offers'][0])=={'offer_id','status','listing_id','sku','marketplace','reason'}
+    assert (saved['ebay_offer_id'],saved['ebay_listing_id'],saved['ebay_publication_state'])==(
+        original['ebay_offer_id'],original['ebay_listing_id'],original['ebay_publication_state'])
+    assert [call[0][0] for call in client.calls]==['GET']
+
+def test_offer_recovery_rejects_multiple_candidates_even_if_one_matches(tmp_path):
+    cfg,db=make(tmp_path); item=recovery_item(db,'VO-000005')
+    client=Client([{'offers':[recovery_offer(item['sku']),recovery_offer(item['sku'],offerId='SECOND')]}])
+
+    with pytest.raises(EbayError): EbayService(cfg,db,client).recover_offer(item)
+
+    inspection=json.loads(db.get_item(item['id'])['last_error'])['inspection']
+    assert inspection['reason']=='multiple_offers' and len(inspection['offers'])==2
+    assert [call[0][0] for call in client.calls]==['GET']

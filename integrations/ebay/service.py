@@ -1,4 +1,5 @@
 import json
+from decimal import Decimal, InvalidOperation
 from urllib.parse import quote, urlencode
 from .errors import EbayError
 
@@ -20,6 +21,96 @@ class EbayService:
         return {"availability":{"shipToLocationAvailability":{"quantity":item["quantity"]}},"condition":item["condition"],"product":{"title":item["title"],"description":item["description"],"imageUrls":photos,"aspects":aspects}}
     def _offer(self,item):
         return {"sku":item["ebay_sku"],"marketplaceId":self.cfg.marketplace_id,"format":"FIXED_PRICE","availableQuantity":item["quantity"],"categoryId":item.get("category") or self.cfg.category_id,"merchantLocationKey":self.cfg.location_key,"listingDescription":item["description"],"pricingSummary":{"price":{"value":str(item["price"]),"currency":item["currency"]}},"listingPolicies":{"fulfillmentPolicyId":self.cfg.fulfillment_policy_id,"paymentPolicyId":self.cfg.payment_policy_id,"returnPolicyId":self.cfg.return_policy_id}}
+
+    @staticmethod
+    def _safe_offer(offer):
+        """Return only identifiers and state that are safe to show or persist."""
+        listing=offer.get("listing") if isinstance(offer.get("listing"),dict) else {}
+        return {"offer_id":offer.get("offerId"),"status":offer.get("status"),
+                "listing_id":listing.get("listingId"),"sku":offer.get("sku"),
+                "marketplace":offer.get("marketplaceId")}
+
+    def inspect_recovery_offer(self,item):
+        """Read seller-scoped offers and prove identity plus the full offer contract."""
+        sku=item["sku"]; marketplace="EBAY_US"
+        expected=self._offer(dict(item,ebay_sku=sku))
+        try: result=self.client.request("GET",f"/sell/inventory/v1/offer?sku={quote(sku,safe='')}&marketplace_id={marketplace}")
+        except EbayError:
+            return {"classification":"ambiguous","sku":sku,"marketplace":marketplace,
+                    "offers":[],"reason":"provider_inspection_error"}
+        offers=result.get("offers") if isinstance(result,dict) else None
+        if not isinstance(offers,list):
+            return {"classification":"ambiguous","sku":sku,"marketplace":marketplace,
+                    "offers":[],"reason":"invalid_offer_collection"}
+        reports=[]; matches=[]
+        for remote in offers:
+            if not isinstance(remote,dict):
+                reports.append({"offer_id":None,"status":None,"listing_id":None,"sku":None,
+                                "marketplace":None,"reason":"malformed_offer"}); continue
+            safe=self._safe_offer(remote); mismatches=[]
+            if item.get("ebay_sku") not in (None,"",sku): mismatches.append("seller_snapshot_sku_mismatch")
+            if self.cfg.marketplace_id!=marketplace: mismatches.append("seller_snapshot_marketplace_mismatch")
+            for name,value in (("merchant_location_key",self.cfg.location_key),
+                ("fulfillment_policy_id",self.cfg.fulfillment_policy_id),("payment_policy_id",self.cfg.payment_policy_id),
+                ("return_policy_id",self.cfg.return_policy_id)):
+                if not isinstance(value,str) or not value.strip(): mismatches.append(f"missing_seller_snapshot_{name}")
+            comparisons=(("offer_id",remote.get("offerId"),None),("sku",remote.get("sku"),sku),
+                ("marketplace",remote.get("marketplaceId"),marketplace),("format",remote.get("format"),"FIXED_PRICE"),
+                ("available_quantity",remote.get("availableQuantity"),expected["availableQuantity"]),
+                ("category_id",remote.get("categoryId"),expected["categoryId"]),
+                ("merchant_location_key",remote.get("merchantLocationKey"),expected["merchantLocationKey"]),
+                ("listing_description",remote.get("listingDescription"),expected["listingDescription"]))
+            for name,actual,wanted in comparisons:
+                if name=="offer_id":
+                    if not actual: mismatches.append("missing_offer_id")
+                elif str(actual) != str(wanted): mismatches.append(f"{name}_mismatch")
+            policies=remote.get("listingPolicies") if isinstance(remote.get("listingPolicies"),dict) else {}
+            for key in ("fulfillmentPolicyId","paymentPolicyId","returnPolicyId"):
+                if policies.get(key)!=expected["listingPolicies"][key]: mismatches.append(f"{key}_mismatch")
+            price=(remote.get("pricingSummary") or {}).get("price",{}) if isinstance(remote.get("pricingSummary"),dict) else {}
+            if price.get("currency")!=expected["pricingSummary"]["price"]["currency"]: mismatches.append("price_currency_mismatch")
+            try: price_matches=Decimal(str(price.get("value")))==Decimal(str(expected["pricingSummary"]["price"]["value"]))
+            except (InvalidOperation,TypeError,ValueError): price_matches=False
+            if not price_matches: mismatches.append("price_value_mismatch")
+            status=str(remote.get("status") or "").upper(); listing=safe["listing_id"]
+            if status=="UNPUBLISHED" and listing: mismatches.append("unpublished_offer_has_listing_id")
+            elif status in ("PUBLISHED","ACTIVE") and not listing: mismatches.append("published_offer_missing_listing_id")
+            elif status not in ("UNPUBLISHED","PUBLISHED","ACTIVE"): mismatches.append("unsupported_status")
+            safe["reason"]="match" if not mismatches else ",".join(mismatches)
+            reports.append(safe)
+            if not mismatches: matches.append(remote)
+        reason="exactly_one_match" if len(matches)==1 and len(offers)==1 else (
+            "no_offers" if not offers else "multiple_offers" if len(offers)>1 else reports[0]["reason"])
+        return {"classification":"recoverable" if len(matches)==1 and len(offers)==1 else "ambiguous",
+                "sku":sku,"marketplace":marketplace,"offers":reports,"reason":reason,
+                "match":matches[0] if len(matches)==1 and len(offers)==1 else None}
+
+    def recover_offer(self,item):
+        """Inspect first; only an exactly proven offer may be published or adopted."""
+        lock=self.db.acquire_publication_lock(item["id"])
+        if not lock: raise EbayError("conflict","Another publication recovery is already in progress; wait before inspecting again")
+        try: return self._recover_offer_locked(self.db.get_item(item["id"]))
+        finally: self.db.release_publication_lock(item["id"],lock)
+
+    def _recover_offer_locked(self,item):
+        report=self.inspect_recovery_offer(item); remote=report.pop("match",None)
+        if not remote:
+            error=EbayError("manual_resolution",f"Offer recovery for {report['sku']} on {report['marketplace']} is ambiguous: {report['reason']}",details=report["offers"])
+            self.db.update_item(item["id"],last_error=json.dumps({**error.safe_dict(),"inspection":report},sort_keys=True))
+            raise error
+        offer_id=remote["offerId"]; status=str(remote["status"]).upper()
+        if status=="UNPUBLISHED":
+            item=self.db.update_item(item["id"],ebay_sku=report["sku"],ebay_offer_id=offer_id,
+                                     ebay_publication_state="offer_created")
+            try: published=self.client.request("POST",f"/sell/inventory/v1/offer/{quote(offer_id,safe='')}/publish",expected=(200,))
+            except EbayError as error:
+                self.db.update_item(item["id"],ebay_publication_state="partial_failure",last_error=json.dumps(error.safe_dict()))
+                raise
+            listing_id=published.get("listingId")
+            if not listing_id: raise EbayError("manual_resolution","eBay published the inspected offer without returning a listing ID")
+        else: listing_id=remote["listing"]["listingId"]
+        return self.db.update_item(item["id"],ebay_sku=report["sku"],ebay_offer_id=offer_id,
+            ebay_listing_id=listing_id,ebay_publication_state="published",status="Active",last_error=None)
     def listItem(self,item):
         if not getattr(self.cfg,"ebay_listing_enabled",True): raise EbayError("listing_disabled","New listings are temporarily disabled")
         if self.cfg.ebay_provider_mode=="production":

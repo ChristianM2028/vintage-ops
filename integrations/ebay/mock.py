@@ -21,6 +21,8 @@ class MockEbayAdapter:
         if not item.get("ebay_offer_id"): raise EbayError("conflict","List the item before synchronizing edits")
         return self.db.update_marketplace(item["id"],ebay_sync_state="synchronized",last_error=None)
     def synchronize(self,item): return self.db.update_marketplace(item["id"],ebay_sync_state=item.get("ebay_publication_state") or "not_listed",last_error=None)
+    def recover_offer(self,item):
+        raise EbayError("manual_resolution","Remote offer recovery is only available for an authenticated eBay seller")
     def inspect_offer(self,item):
         mode=self.inspect_mode or item.get("ebay_publication_state")
         classification=mode if mode in ("published","withdrawn","missing","ambiguous") else "ambiguous"
