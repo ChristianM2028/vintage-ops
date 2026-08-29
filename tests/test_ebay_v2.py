@@ -5,6 +5,7 @@ import pytest
 from config import Config
 from db import Database
 from integrations.ebay.errors import EbayError
+from integrations.ebay.errors import parse_error
 from integrations.ebay.oauth import OAuthManager, SCOPES
 from integrations.ebay.photos import EbayImagePublisher
 from integrations.ebay.service import EbayService
@@ -28,6 +29,11 @@ class Client:
         self.calls.append((args,kwargs)); value=self.responses.pop(0)
         if isinstance(value,Exception): raise value
         return value
+
+class Response:
+    def __init__(self,status,data):
+        self.status_code=status; self.data=data; self.headers={}; self.content=b'error'
+    def json(self): return self.data
 
 def make(tmp_path):
     cfg=Config(database_path=str(tmp_path/'db'),upload_directory=str(tmp_path/'uploads'),encryption_key=Fernet.generate_key().decode(),client_id='id',client_secret='secret',runame='name',location_key='loc',fulfillment_policy_id='f',payment_policy_id='p',return_policy_id='r',category_id='1',ebay_provider_mode="sandbox")
@@ -131,6 +137,22 @@ def test_existing_remote_offer_repairs_local_item_without_create_or_delete(tmp_p
     assert result['ebay_offer_id']=='O6' and result['ebay_listing_id']=='L6'
     assert not any(call[0][0] in ('POST','DELETE') and call[0][1]=='/sell/inventory/v1/offer' for call in client.calls)
 
+def test_real_get_offers_shape_adopts_unpublished_offer_without_create(tmp_path):
+    cfg,db=make(tmp_path); item=db.create_item(title='x',description='x',price='1',currency='USD',quantity=1,condition='NEW',category='1',photo_urls=['https://cdn/x'])
+    # getOffers does not necessarily echo merchantLocationKey and may return
+    # additional/normalized listing-policy data that was absent at creation.
+    offer={'offerId':'O-REAL','sku':item['sku'],'marketplaceId':'EBAY_US','format':'FIXED_PRICE',
+        'availableQuantity':1,'categoryId':'001','status':'UNPUBLISHED',
+        'listingPolicies':{'fulfillmentPolicyId':'f','paymentPolicyId':'p','returnPolicyId':'r',
+            'eBayPlusIfEligible':False},
+        'pricingSummary':{'price':{'value':'1.00','currency':'USD'}}}
+    client=Client([{}, {'total':1,'size':1,'offers':[offer]}, {'listingId':'L-REAL'}])
+
+    result=EbayService(cfg,db,client).list(item)
+
+    assert result['ebay_offer_id']=='O-REAL' and result['ebay_listing_id']=='L-REAL'
+    assert not any(call[0]==('POST','/sell/inventory/v1/offer') for call in client.calls)
+
 def test_duplicate_offer_response_queries_state_and_fails_closed(tmp_path):
     cfg,db=make(tmp_path); item=db.create_item(title='x',description='x',price='1',currency='USD',quantity=1,condition='NEW',category='1',photo_urls=['https://cdn/x'])
     duplicate=EbayError('conflict','Offer entity already exists.',status=409)
@@ -141,6 +163,29 @@ def test_duplicate_offer_response_queries_state_and_fails_closed(tmp_path):
     creates=[call for call in client.calls if call[0]==('POST','/sell/inventory/v1/offer')]
     assert len(creates)==1 and error.value.kind=='manual_resolution'
     assert item['sku'] in str(error.value) and 'EBAY_US' in str(error.value) and 'no create retry' in str(error.value)
+
+def test_http_400_structured_duplicate_offer_response_is_reconciled(tmp_path):
+    cfg,db=make(tmp_path); item=db.create_item(title='x',description='x',price='1',currency='USD',quantity=1,condition='NEW',category='1',photo_urls=['https://cdn/x'])
+    duplicate=parse_error(Response(400,{'errors':[{'errorId':25002,'domain':'API_INVENTORY',
+        'category':'REQUEST','message':'A user error has occurred.',
+        'longMessage':'Offer entity already exists.'}]}))
+    offer={'offerId':'O-400','sku':item['sku'],'marketplaceId':'EBAY_US','format':'FIXED_PRICE','status':'UNPUBLISHED'}
+    client=Client([{}, {'offers':[]}, duplicate, {'offers':[offer]}, {'listingId':'L-400'}])
+
+    result=EbayService(cfg,db,client).list(item)
+
+    assert duplicate.status==400 and duplicate.details[0]['errorId']==25002
+    assert result['ebay_offer_id']=='O-400' and result['ebay_listing_id']=='L-400'
+    assert sum(call[0]==('POST','/sell/inventory/v1/offer') for call in client.calls)==1
+
+def test_offer_discovery_fails_closed_when_returned_identity_is_missing(tmp_path):
+    cfg,db=make(tmp_path); item=db.create_item(title='x',description='x',price='1',currency='USD',quantity=1,condition='NEW',category='1',photo_urls=['https://cdn/x'])
+    client=Client([{}, {'offers':[{'offerId':'UNKNOWN','marketplaceId':'EBAY_US','status':'UNPUBLISHED'}]}])
+
+    with pytest.raises(EbayError) as error: EbayService(cfg,db,client).list(item)
+
+    assert error.value.kind=='manual_resolution'
+    assert not any(call[0]==('POST','/sell/inventory/v1/offer') for call in client.calls)
 
 def test_order_reconciliation_is_idempotent_and_removes_sold_stock(tmp_path):
     cfg,db=make(tmp_path); item=db.create_item(title='x',description='x',price='1',currency='USD',quantity=1,condition='NEW',category='1',photo_urls=[],sku='SKU')

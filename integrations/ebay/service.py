@@ -73,19 +73,50 @@ class EbayService:
     def _matching_offers(self,item):
         sku=item["ebay_sku"]; marketplace=self.cfg.marketplace_id
         result=self.client.request("GET",f"/sell/inventory/v1/offer?sku={quote(sku,safe='')}&marketplace_id={quote(marketplace,safe='')}")
-        expected=self._offer(item)
-        contract_keys=("sku","marketplaceId","format","categoryId","merchantLocationKey","listingPolicies")
-        return [offer for offer in result.get("offers",[]) if all(offer.get(key)==expected.get(key) for key in contract_keys)]
+        offers=result.get("offers",[])
+        if not isinstance(offers,list):
+            raise EbayError("manual_resolution",f"Cannot safely inspect offers for SKU {sku} on {marketplace}: eBay returned an invalid offer collection")
+
+        matches=[]; ambiguous=[]
+        for offer in offers:
+            if not isinstance(offer,dict):
+                ambiguous.append(offer); continue
+            remote_sku=offer.get("sku"); remote_marketplace=offer.get("marketplaceId")
+            # getOffers is seller-scoped, but its query parameters are not an
+            # identity guarantee. Never infer either identity when it is absent.
+            if remote_sku is None or remote_marketplace is None:
+                ambiguous.append(offer); continue
+            if remote_sku != sku or remote_marketplace != marketplace:
+                continue
+            status=str(offer.get("status") or "").upper()
+            listing_id=(offer.get("listing") or {}).get("listingId") if isinstance(offer.get("listing") or {},dict) else None
+            offer_format=str(offer.get("format") or "FIXED_PRICE").upper()
+            if (not offer.get("offerId") or status not in ("", "UNPUBLISHED") or
+                    listing_id or offer_format != "FIXED_PRICE"):
+                ambiguous.append(offer); continue
+            # Category, location, and policy fields in getOffers may be omitted
+            # or represented differently from createOffer. They are mutable
+            # listing configuration, not seller-offer identity.
+            matches.append(offer)
+        if ambiguous:
+            raise self._offer_resolution_error(item,matches + ambiguous,"during discovery")
+        return matches
     @staticmethod
     def _ambiguous_create_error(error):
         if error.status is None or (error.status and error.status>=500): return True
-        text=" ".join([str(error)]+[str(detail.get("message") or "")+" "+str(detail.get("longMessage") or "") for detail in error.details]).casefold()
-        return error.status==409 and "offer" in text and ("already exists" in text or "duplicate" in text)
+        duplicate_text="offer entity already exists"
+        for detail in error.details:
+            text=" ".join(str(detail.get(key) or "") for key in ("message","longMessage")).casefold()
+            if detail.get("errorId") == 25002 and duplicate_text in text:
+                return True
+        # Some client adapters do not expose structured details. Match eBay's
+        # exact duplicate-offer wording, without assuming a particular 4xx.
+        return duplicate_text in str(error).casefold()
     def _offer_resolution_error(self,item,offers,phase,original=None):
         sku=item["ebay_sku"]; marketplace=self.cfg.marketplace_id
         count=len(offers)
         message=(f"Cannot safely continue offer creation for SKU {sku} on {marketplace} {phase}: "
-                 f"found {count} seller-scoped offers matching the expected listing contract; expected exactly one. "
+                 f"found {count} seller-scoped candidate or ambiguous offers; expected exactly one unambiguous unpublished offer. "
                  "Inspect this exact SKU and marketplace in Seller Hub; no create retry was attempted.")
         return EbayError("manual_resolution",message,status=getattr(original,"status",None),
                          request_id=getattr(original,"request_id",None),rlogid=getattr(original,"rlogid",None))
