@@ -593,6 +593,8 @@ def create_app(config=None, http=None, stripe_adapter=None):
         return redirect(url_for("item_page",item_id=item_id))
     @app.post("/items/<int:item_id>/list-ebay")
     def list_ebay(item_id): return run_action(item_id,"list","Listed on eBay.")
+    @app.post("/items/<int:item_id>/recover-ebay-offer")
+    def recover_ebay_offer(item_id): return run_action(item_id,"recover_offer","Inspected and recovered the existing eBay offer.")
     @app.post("/items/<int:item_id>/delist-ebay")
     def delist_ebay(item_id): return run_action(item_id,"delist","Delisted from eBay.")
     @app.post("/items/<int:item_id>/sync-ebay")
