@@ -26,31 +26,35 @@ class EbayService:
             from .production_validation import require_production_activation
             require_production_activation(self.cfg,self.db,self.cfg.expected_ebay_seller_id)
         self._prereqs(item)
+        sku=item.get("ebay_sku") or item["sku"]
+        marketplace=self.cfg.marketplace_id
+        if item.get("ebay_sku") and item["ebay_sku"] != item["sku"]:
+            raise EbayError("manual_resolution",f"Refusing to list {item['sku']}: persisted eBay SKU {item['ebay_sku']} does not match")
+        if item.get("ebay_marketplace_id") and item["ebay_marketplace_id"] != marketplace:
+            raise EbayError("manual_resolution",f"Refusing to list {sku}: item marketplace {item['ebay_marketplace_id']} does not match {marketplace}")
         lock=self.db.acquire_publication_lock(item["id"])
         if not lock: raise EbayError("conflict","Another publication is already in progress; wait and synchronize")
-        sku=item.get("ebay_sku") or item["sku"]
         if not item.get("ebay_sku"): item=self.db.update_item(item["id"],ebay_sku=sku,ebay_publication_state="preparing",last_error=None)
         try:
             self.client.request("PUT",f"/sell/inventory/v1/inventory_item/{quote(sku,safe='')}",json=self._inventory(item),expected=(200,204))
             self.db.update_item(item["id"],ebay_publication_state="inventory_ready")
             if not item.get("ebay_offer_id"):
-                # Recover first after a prior uncertain operation/process restart.
-                current=self.db.get_item(item["id"])
-                if current.get("ebay_publication_state") in ("creating_offer","failed","partial_failure"):
-                    offers=self._matching_offers(sku)
-                    if len(offers)>1: raise EbayError("manual_resolution","Multiple eBay offers match this SKU and marketplace; resolve duplicates in Seller Hub")
-                    if offers: item=self.db.update_item(item["id"],ebay_offer_id=offers[0]["offerId"],ebay_publication_state="offer_created")
+                # Always inspect seller-scoped remote state before the one
+                # non-idempotent create. This also repairs records whose prior
+                # response was lost before their local state was persisted.
+                offers=self._matching_offers(item)
+                if len(offers)>1: raise self._offer_resolution_error(item,offers,"before create")
+                if offers: item=self.db.update_item(item["id"],ebay_offer_id=offers[0]["offerId"],ebay_publication_state="offer_created")
                 if not item.get("ebay_offer_id"):
                     self.db.update_item(item["id"],ebay_publication_state="creating_offer")
                     try: result=self.client.request("POST","/sell/inventory/v1/offer",json=self._offer(item),expected=(201,))
                     except EbayError as e:
-                        if e.kind=="remote":
-                            offers=self._matching_offers(sku)
+                        if self._ambiguous_create_error(e):
+                            offers=self._matching_offers(item)
                             if len(offers)==1: result={"offerId":offers[0]["offerId"]}
-                            elif len(offers)>1: raise EbayError("manual_resolution","Multiple matching offers were found after an ambiguous create")
-                            else: raise
+                            else: raise self._offer_resolution_error(item,offers,"after ambiguous create",e)
                         else: raise
-                item=self.db.update_item(item["id"],ebay_offer_id=result["offerId"],ebay_publication_state="offer_created")
+                    item=self.db.update_item(item["id"],ebay_offer_id=result["offerId"],ebay_publication_state="offer_created")
             try: result=self.client.request("POST",f"/sell/inventory/v1/offer/{quote(item['ebay_offer_id'],safe='')}/publish",expected=(200,))
             except EbayError as e:
                 if e.kind=="remote":
@@ -66,9 +70,25 @@ class EbayService:
             if state=="partial_failure": e.kind="partial_publication"
             raise
         finally: self.db.release_publication_lock(item["id"],lock)
-    def _matching_offers(self,sku):
-        result=self.client.request("GET",f"/sell/inventory/v1/offer?sku={quote(sku,safe='')}&marketplace_id={quote(self.cfg.marketplace_id,safe='')}")
-        return [o for o in result.get("offers",[]) if o.get("sku")==sku and o.get("marketplaceId",self.cfg.marketplace_id)==self.cfg.marketplace_id]
+    def _matching_offers(self,item):
+        sku=item["ebay_sku"]; marketplace=self.cfg.marketplace_id
+        result=self.client.request("GET",f"/sell/inventory/v1/offer?sku={quote(sku,safe='')}&marketplace_id={quote(marketplace,safe='')}")
+        expected=self._offer(item)
+        contract_keys=("sku","marketplaceId","format","categoryId","merchantLocationKey","listingPolicies")
+        return [offer for offer in result.get("offers",[]) if all(offer.get(key)==expected.get(key) for key in contract_keys)]
+    @staticmethod
+    def _ambiguous_create_error(error):
+        if error.status is None or (error.status and error.status>=500): return True
+        text=" ".join([str(error)]+[str(detail.get("message") or "")+" "+str(detail.get("longMessage") or "") for detail in error.details]).casefold()
+        return error.status==409 and "offer" in text and ("already exists" in text or "duplicate" in text)
+    def _offer_resolution_error(self,item,offers,phase,original=None):
+        sku=item["ebay_sku"]; marketplace=self.cfg.marketplace_id
+        count=len(offers)
+        message=(f"Cannot safely continue offer creation for SKU {sku} on {marketplace} {phase}: "
+                 f"found {count} seller-scoped offers matching the expected listing contract; expected exactly one. "
+                 "Inspect this exact SKU and marketplace in Seller Hub; no create retry was attempted.")
+        return EbayError("manual_resolution",message,status=getattr(original,"status",None),
+                         request_id=getattr(original,"request_id",None),rlogid=getattr(original,"rlogid",None))
     def updateItem(self,item):
         if not item.get("ebay_sku") or not item.get("ebay_offer_id"): raise EbayError("conflict","Item has no persisted eBay SKU and offer ID; list it first")
         try:
