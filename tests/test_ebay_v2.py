@@ -88,9 +88,59 @@ def test_photo_mutation_retains_eps_metadata_and_last_good_urls(tmp_path):
 
 def test_ambiguous_create_recovers_remote_offer(tmp_path):
     cfg,db=make(tmp_path); item=db.create_item(title='x',description='x',price='1',currency='USD',quantity=1,condition='NEW',category='1',photo_urls=['https://cdn/x'])
-    remote=EbayError('remote','timeout'); client=Client([{},remote,{'offers':[{'offerId':'O','sku':item['sku'],'marketplaceId':'EBAY_US'}]},{'listingId':'L'}])
+    offer={'offerId':'O','sku':item['sku'],'marketplaceId':'EBAY_US','format':'FIXED_PRICE','categoryId':'1','merchantLocationKey':'loc','listingPolicies':{'fulfillmentPolicyId':'f','paymentPolicyId':'p','returnPolicyId':'r'}}
+    remote=EbayError('remote','timeout'); client=Client([{}, {'offers':[]},remote,{'offers':[offer]},{'listingId':'L'}])
     result=EbayService(cfg,db,client).list(item)
     assert result['ebay_offer_id']=='O' and result['ebay_listing_id']=='L'
+
+@pytest.mark.parametrize('failure',[EbayError('remote','timeout'),EbayError('remote','unavailable',status=503)])
+def test_committed_create_response_failure_is_reconciled_without_retry(tmp_path,failure):
+    cfg,db=make(tmp_path); item=db.create_item(title='x',description='x',price='1',currency='USD',quantity=1,condition='NEW',category='1',photo_urls=['https://cdn/x'])
+    offer={'offerId':'O','sku':item['sku'],'marketplaceId':'EBAY_US','format':'FIXED_PRICE','categoryId':'1','merchantLocationKey':'loc','listingPolicies':{'fulfillmentPolicyId':'f','paymentPolicyId':'p','returnPolicyId':'r'}}
+    client=Client([{}, {'offers':[]},failure,{'offers':[offer]},{'listingId':'L'}])
+
+    result=EbayService(cfg,db,client).list(item)
+
+    creates=[call for call in client.calls if call[0]==('POST','/sell/inventory/v1/offer')]
+    assert len(creates)==1 and result['ebay_offer_id']=='O' and result['ebay_listing_id']=='L'
+
+def test_consecutive_items_send_unique_exact_skus_and_create_one_offer_each(tmp_path):
+    cfg,db=make(tmp_path)
+    items=[db.create_item(title='x',description='x',price='1',currency='USD',quantity=1,condition='NEW',category='1',photo_urls=['https://cdn/x']) for _ in range(2)]
+    client=Client([{}, {'offers':[]},{'offerId':'O5'},{'listingId':'L5'}, {}, {'offers':[]},{'offerId':'O6'},{'listingId':'L6'}])
+    service=EbayService(cfg,db,client)
+
+    for item in items: service.list(item)
+
+    inventory_puts=[call for call in client.calls if call[0][0]=='PUT' and '/inventory_item/' in call[0][1]]
+    creates=[call for call in client.calls if call[0]==('POST','/sell/inventory/v1/offer')]
+    lookups=[call for call in client.calls if call[0][0]=='GET' and '/offer?' in call[0][1]]
+    assert [call[0][1].rsplit('/',1)[-1] for call in inventory_puts]==['VO-000001','VO-000002']
+    assert [call[1]['json']['sku'] for call in creates]==['VO-000001','VO-000002']
+    assert all(call[1]['json']['marketplaceId']=='EBAY_US' for call in creates)
+    assert [call[0][1] for call in lookups]==['/sell/inventory/v1/offer?sku=VO-000001&marketplace_id=EBAY_US','/sell/inventory/v1/offer?sku=VO-000002&marketplace_id=EBAY_US']
+    assert len(creates)==2
+
+def test_existing_remote_offer_repairs_local_item_without_create_or_delete(tmp_path):
+    cfg,db=make(tmp_path); item=db.create_item(sku='VO-000006',title='x',description='x',price='1',currency='USD',quantity=1,condition='NEW',category='1',photo_urls=['https://cdn/x'])
+    offer={'offerId':'O6','sku':'VO-000006','marketplaceId':'EBAY_US','format':'FIXED_PRICE','categoryId':'1','merchantLocationKey':'loc','listingPolicies':{'fulfillmentPolicyId':'f','paymentPolicyId':'p','returnPolicyId':'r'}}
+    client=Client([{}, {'offers':[offer]},{'listingId':'L6'}])
+
+    result=EbayService(cfg,db,client).list(item)
+
+    assert result['ebay_offer_id']=='O6' and result['ebay_listing_id']=='L6'
+    assert not any(call[0][0] in ('POST','DELETE') and call[0][1]=='/sell/inventory/v1/offer' for call in client.calls)
+
+def test_duplicate_offer_response_queries_state_and_fails_closed(tmp_path):
+    cfg,db=make(tmp_path); item=db.create_item(title='x',description='x',price='1',currency='USD',quantity=1,condition='NEW',category='1',photo_urls=['https://cdn/x'])
+    duplicate=EbayError('conflict','Offer entity already exists.',status=409)
+    client=Client([{}, {'offers':[]},duplicate,{'offers':[]}])
+
+    with pytest.raises(EbayError) as error: EbayService(cfg,db,client).list(item)
+
+    creates=[call for call in client.calls if call[0]==('POST','/sell/inventory/v1/offer')]
+    assert len(creates)==1 and error.value.kind=='manual_resolution'
+    assert item['sku'] in str(error.value) and 'EBAY_US' in str(error.value) and 'no create retry' in str(error.value)
 
 def test_order_reconciliation_is_idempotent_and_removes_sold_stock(tmp_path):
     cfg,db=make(tmp_path); item=db.create_item(title='x',description='x',price='1',currency='USD',quantity=1,condition='NEW',category='1',photo_urls=[],sku='SKU')

@@ -56,13 +56,13 @@ def test_automatic_refresh_and_revocation(env):
     with pytest.raises(EbayError) as exc: OAuthManager(cfg,db,HTTP([Response(400,{"errors":[{"errorId":1100,"message":"invalid refresh"}]})])).access_token()
     assert exc.value.kind=="reauthorization_required"
 def test_full_lifecycle_persists_ids_and_withdraws(env,item):
-    cfg,db=env; client=FakeClient([{}, {"offerId":"OFF1"},{"listingId":"LIST1"}, {}, {}, {}]); svc=EbayService(cfg,db,client)
+    cfg,db=env; client=FakeClient([{}, {"offers":[]}, {"offerId":"OFF1"},{"listingId":"LIST1"}, {}, {}, {}]); svc=EbayService(cfg,db,client)
     listed=svc.listItem(item); assert (listed["ebay_sku"],listed["ebay_offer_id"],listed["ebay_listing_id"],listed["ebay_publication_state"])==("TEST-1","OFF1","LIST1","published")
     svc.updateItem(listed); withdrawn=svc.delistItem(db.get_item(item["id"])); assert withdrawn["ebay_publication_state"]=="withdrawn"
-    assert [c[0][0] for c in client.calls]==["PUT","POST","POST","PUT","PUT","POST"]
+    assert [c[0][0] for c in client.calls]==["PUT","GET","POST","POST","PUT","PUT","POST"]
 def test_partial_publish_retry_reuses_offer(env,item):
     cfg,db=env; failure=EbayError("remote","publish failed")
-    with pytest.raises(EbayError) as exc: EbayService(cfg,db,FakeClient([{}, {"offerId":"OFF1"},failure])).listItem(item)
+    with pytest.raises(EbayError) as exc: EbayService(cfg,db,FakeClient([{}, {"offers":[]}, {"offerId":"OFF1"},failure])).listItem(item)
     partial=db.get_item(item["id"]); assert partial["ebay_offer_id"]=="OFF1" and partial["ebay_publication_state"]=="partial_failure" and exc.value.kind=="partial_publication"
     client=FakeClient([{}, {"listingId":"LIST1"}]); done=EbayService(cfg,db,client).listItem(partial); assert done["listing_id"] if False else done["ebay_listing_id"]=="LIST1"; assert len(client.calls)==2
 def test_prerequisite_and_photo_validation(env,item):
@@ -107,6 +107,7 @@ def test_response_logging_is_structured_correlated_and_secret_free(env,caplog):
     assert caplog.records[0].levelno==logging.INFO
     assert caplog.records[0].ebay_response=={
         "method":"POST","path":"/sell/inventory/v1/location/vintage-ops-main?limit=20&offset=5","status":500,
+        "marketplace_id":"EBAY_US",
         "error_id":25002,"rlogid":"rlog-500","x-ebay-c-request-id":"request-500",
         "x-ebay-correlation-id":"correlation-500"}
     rendered=caplog.text+repr(caplog.records[0].ebay_response)

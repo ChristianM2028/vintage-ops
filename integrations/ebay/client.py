@@ -1,6 +1,6 @@
 import logging
 import re
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 from xml.etree import ElementTree
 
 import requests
@@ -96,6 +96,14 @@ class EbayClient:
         try: errors=r.json().get("errors",[])
         except (ValueError,AttributeError): errors=[]
         fields={"method":normalized_method,"path":relative_path,"status":r.status_code}
+        if parsed.path.startswith("/sell/inventory/v1/"):
+            fields["marketplace_id"]=headers["X-EBAY-C-MARKETPLACE-ID"]
+            sku=(json or {}).get("sku") if isinstance(json,dict) else None
+            if parsed.path.startswith("/sell/inventory/v1/inventory_item/"):
+                sku=unquote(parsed.path.rsplit("/",1)[-1])
+            elif parsed.path=="/sell/inventory/v1/offer" and normalized_method=="GET":
+                sku=(parse_qs(parsed.query).get("sku") or [None])[0]
+            if sku is not None: fields["sku"]=sku
         if errors and errors[0].get("errorId") is not None: fields["error_id"]=errors[0]["errorId"]
         for header,field in (("rlogid","rlogid"),("x-ebay-c-request-id","x-ebay-c-request-id"),("x-ebay-correlation-id","x-ebay-correlation-id")):
             value=_header(r.headers,header)
